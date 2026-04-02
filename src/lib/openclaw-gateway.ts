@@ -63,3 +63,98 @@ export async function callOpenClawGateway<T = unknown>(
 
   return payload as T
 }
+
+/**
+ * Spawn an ACP session (e.g. Codex, Claude Code) via sessions_spawn.
+ * Returns the sessionId immediately — the session runs asynchronously.
+ */
+export async function spawnAcpSession(params: {
+  task: string
+  agentId?: string
+  model?: string
+  label?: string
+  cwd?: string
+  timeoutSeconds?: number
+}): Promise<{ sessionId: string; spawnId: string }> {
+  const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+  const invokeParams: Record<string, unknown> = {
+    task: params.task,
+    runtime: 'acp',
+    agentId: params.agentId || 'codex',
+    mode: 'session',
+    thread: false,
+    label: params.label || spawnId,
+  }
+  if (params.model) invokeParams.model = params.model
+  if (params.cwd) invokeParams.cwd = params.cwd
+  if (params.timeoutSeconds) invokeParams.runTimeoutSeconds = params.timeoutSeconds
+
+  const result = await callOpenClawGateway<any>(
+    'sessions_spawn',
+    invokeParams,
+    15_000,
+  )
+
+  const sessionId: string | null =
+    typeof result?.sessionId === 'string' ? result.sessionId
+    : typeof result?.session_id === 'string' ? result.session_id
+    : typeof result?.sessionKey === 'string' ? result.sessionKey
+    : null
+
+  if (!sessionId) {
+    throw new Error(`sessions_spawn returned no sessionId: ${JSON.stringify(result)}`)
+  }
+
+  return { sessionId, spawnId }
+}
+
+/**
+ * Poll an ACP session's history until the agent completes or a timeout is reached.
+ * Returns the final result text from the session.
+ */
+export async function pollAcpSessionUntilComplete(
+  sessionId: string,
+  timeoutMs = 180_000,
+  pollIntervalMs = 10000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+
+    try {
+      const history = await callOpenClawGateway<any>(
+        'sessions_history',
+        { sessionKey: sessionId, limit: 10 },
+        10_000,
+      )
+
+      const messages = history?.messages ?? history ?? []
+      if (!Array.isArray(messages) || messages.length === 0) continue
+
+      const lastMsg = messages[messages.length - 1]
+      const status = String(lastMsg?.status ?? lastMsg?.state ?? '').toLowerCase()
+      const isDone = ['done', 'completed', 'finished', 'error', 'failed'].includes(status)
+
+      if (isDone || messages.length > 1) {
+        const textParts: string[] = []
+        for (const msg of messages) {
+          if (msg.role === 'assistant' || msg.type === 'assistant') {
+            const text = msg.text ?? msg.content ?? msg.output ?? ''
+            if (typeof text === 'string' && text.trim()) {
+              textParts.push(text.trim())
+            }
+          }
+        }
+        if (textParts.length > 0) {
+          return textParts.join('\n')
+        }
+        return JSON.stringify(lastMsg)
+      }
+    } catch (err) {
+      console.warn(`pollAcpSessionUntilComplete: ${err}`)
+    }
+  }
+
+  throw new Error(`ACP session ${sessionId} did not complete within ${timeoutMs}ms`)
+}

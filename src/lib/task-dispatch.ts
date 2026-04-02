@@ -1,6 +1,6 @@
 import { getDatabase, db_helpers } from './db'
 import { runOpenClaw } from './command'
-import { callOpenClawGateway } from './openclaw-gateway'
+import { callOpenClawGateway, spawnAcpSession, pollAcpSessionUntilComplete } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
@@ -724,34 +724,51 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           sessionId: sendResult?.runId || targetSession,
         }
       } else {
-        // Step 1: Invoke via gateway (new session)
+        // Spawn via ACP (sessions_spawn with runtime:"acp", mode:"session").
+        // This gives the agent a persistent session with context continuity,
+        // rather than the legacy gateway call agent approach.
         const gatewayAgentId = resolveGatewayAgentId(task)
         const dispatchModel = classifyTaskModel(task)
-        const invokeParams: Record<string, unknown> = {
-          message: prompt,
-          agentId: gatewayAgentId,
-          idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-          deliver: false,
-        }
-        // Route to appropriate model tier based on task complexity.
-        // null = no override, agent uses its own configured default model.
-        if (dispatchModel) invokeParams.model = dispatchModel
 
-        // Use --expect-final to block until the agent completes and returns the full
-        // response payload (result.payloads[0].text). The two-step agent → agent.wait
-        // pattern only returns lifecycle metadata and never includes the agent's text.
-        const finalResult = await runOpenClaw(
-          ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
-          { timeoutMs: 125_000 }
-        )
-        const finalPayload = parseGatewayJson(finalResult.stdout)
-          ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
+        let acpSessionId: string | null = null
+        try {
+          const spawnResult = await spawnAcpSession({
+            task: prompt,
+            agentId: gatewayAgentId,
+            model: dispatchModel ?? undefined,
+            label: `mc-task-${task.id}`,
+            timeoutSeconds: 300,
+          })
+          acpSessionId = spawnResult.sessionId
+          logger.info({ taskId: task.id, sessionId: acpSessionId, agent: gatewayAgentId }, 'ACP session spawned, polling for completion')
 
-        agentResponse = parseAgentResponse(
-          finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
-        )
-        if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
-          agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
+          // Poll until the agent completes (or timeout after 3 min)
+          const resultText = await pollAcpSessionUntilComplete(acpSessionId, 180_000, 10_000)
+          agentResponse = { text: resultText, sessionId: acpSessionId }
+        } catch (err: any) {
+          // If ACP spawn/poll fails, fall back to the legacy gateway path
+          logger.warn({ taskId: task.id, err: err.message }, 'ACP spawn failed, falling back to legacy gateway')
+          const invokeParams: Record<string, unknown> = {
+            message: prompt,
+            agentId: gatewayAgentId,
+            idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
+            deliver: false,
+          }
+          if (dispatchModel) invokeParams.model = dispatchModel
+
+          const finalResult = await runOpenClaw(
+            ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
+            { timeoutMs: 125_000 }
+          )
+          const finalPayload = parseGatewayJson(finalResult.stdout)
+            ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
+
+          agentResponse = parseAgentResponse(
+            finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
+          )
+          if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
+            agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
+          }
         }
       } // end else (new session dispatch)
 
