@@ -334,7 +334,7 @@ export default function LoginPage() {
             type="submit"
             disabled={loading}
             size="lg"
-            className="w-full rounded-lg"
+            className="w-full rounded-lg bg-green-500 hover:bg-green-600 text-white"
           >
             {loading ? (
               <>

@@ -321,7 +321,13 @@ function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
       if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
     } catch { /* ignore */ }
   }
-  return task.assigned_to || 'jarv'
+  const agentName = task.assigned_to || 'main'
+  const agentIdMap: Record<string, string> = {
+    'claude-code-dev': 'codex',
+    'codex-dev': 'codex',
+    'test-claude': 'claude',
+  }
+  return agentIdMap[agentName] || 'main'
 }
 
 function buildReviewPrompt(task: ReviewableTask): string {
@@ -735,7 +741,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         try {
           const spawnResult = await spawnAcpSession({
             task: prompt,
-            agentId: gatewayAgentId,
+            agentId: "codex",
             model: dispatchModel ?? undefined,
             label: `mc-task-${task.id}`,
             timeoutSeconds: 300,
@@ -775,7 +781,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
             logger.warn({ taskId: task.id, err: err.message }, 'ACP spawn failed, falling back to legacy gateway')
             const invokeParams: Record<string, unknown> = {
               message: prompt,
-              agentId: gatewayAgentId,
+              agentId: "codex",
               idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
               deliver: false,
             }
