@@ -113,7 +113,17 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
     lines.push('', '## Previous Review Feedback', rejectionFeedback, '', 'Please address this feedback in your response.')
   }
 
-  lines.push('', 'Complete this task and provide your response. Be concise and actionable.')
+  lines.push('',
+    '## IMPORTANT: Pull Request Required',
+    'You MUST create a Pull Request for this task. Follow these steps:',
+    `1. Create a branch: git checkout -b task-${task.id}/description`,
+    '2. Make your changes',
+    `3. Commit: git commit -m "[TASK-${task.id}] description"`,
+    `4. Push: git push -u origin task-${task.id}/description`,
+    `5. Create PR: gh pr create --title "[TASK-${task.id}] ${task.title}" --body "Task: TASK-${task.id}"`,
+    `6. Write the PR URL to: /tmp/mc-task-${task.id}.pr`,
+    '',
+    'The PR must be created before marking the task as complete. Mission Control will detect the PR and move the task to review.')
   return lines.join('\n')
 }
 
@@ -775,14 +785,19 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         } catch (err: any) {
           // Spawn failed — fall back to blocking gateway call
           logger.warn({ taskId: task.id, err: err.message }, 'acpx spawn failed, falling back to gateway')
+          // Use deliver: true - gateway will deliver result to callback channel (SSE/WebSocket)
+          // For now we don't have a callback listener, so use --expect-final to get result inline
           const invokeParams: Record<string, unknown> = {
             message: prompt,
             agentId: 'codex',
             idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-            deliver: false,
+            deliver: true,
           }
           if (dispatchModel) invokeParams.model = dispatchModel
 
+          // Try non-blocking first (without --expect-final). If no callback listener,
+          // gateway will hold result until agent completes, then deliver to SSE.
+          // We use --expect-final as fallback to get result inline.
           const finalResult = await runOpenClaw(
             ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
             { timeoutMs: 125_000 }
