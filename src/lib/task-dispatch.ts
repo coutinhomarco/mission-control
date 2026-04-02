@@ -725,12 +725,13 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         }
       } else {
         // Spawn via ACP (sessions_spawn with runtime:"acp", mode:"session").
-        // This gives the agent a persistent session with context continuity,
-        // rather than the legacy gateway call agent approach.
+        // This gives the agent a persistent session with context continuity.
         const gatewayAgentId = resolveGatewayAgentId(task)
         const dispatchModel = classifyTaskModel(task)
 
         let acpSessionId: string | null = null
+        let acpSpawned = false
+
         try {
           const spawnResult = await spawnAcpSession({
             task: prompt,
@@ -740,34 +741,59 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
             timeoutSeconds: 300,
           })
           acpSessionId = spawnResult.sessionId
+          acpSpawned = true
           logger.info({ taskId: task.id, sessionId: acpSessionId, agent: gatewayAgentId }, 'ACP session spawned, polling for completion')
 
-          // Poll until the agent completes (or timeout after 3 min)
-          const resultText = await pollAcpSessionUntilComplete(acpSessionId, 180_000, 10_000)
+          // Poll until the agent completes (5 min timeout, matches spawn)
+          const resultText = await pollAcpSessionUntilComplete(acpSessionId, 300_000, 10_000)
           agentResponse = { text: resultText, sessionId: acpSessionId }
         } catch (err: any) {
-          // If ACP spawn/poll fails, fall back to the legacy gateway path
-          logger.warn({ taskId: task.id, err: err.message }, 'ACP spawn failed, falling back to legacy gateway')
-          const invokeParams: Record<string, unknown> = {
-            message: prompt,
-            agentId: gatewayAgentId,
-            idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-            deliver: false,
-          }
-          if (dispatchModel) invokeParams.model = dispatchModel
+          if (acpSpawned && acpSessionId) {
+            // Session was spawned but polling failed. Do NOT fall back to legacy path —
+            // that would re-execute the same task. Instead record the session and
+            // mark the task as in_progress so it can be picked up by Aegis review later.
+            logger.warn({ taskId: task.id, sessionId: acpSessionId, err: err.message }, 'ACP poll failed — session still alive, recording for later review')
 
-          const finalResult = await runOpenClaw(
-            ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
-            { timeoutMs: 125_000 }
-          )
-          const finalPayload = parseGatewayJson(finalResult.stdout)
-            ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
+            // Merge session into metadata and leave status as in_progress
+            const existingMeta = (() => {
+              try {
+                const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
+                return row?.metadata ? JSON.parse(row.metadata) : {}
+              } catch { return {} }
+            })()
+            existingMeta.dispatch_session_id = acpSessionId
+            existingMeta.acp_poll_error = err.message
+            db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?')
+              .run(JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id)
 
-          agentResponse = parseAgentResponse(
-            finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
-          )
-          if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
-            agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
+            agentResponse = {
+              text: `[ACP session ${acpSessionId} started but poll timed out. The agent is still working. Task marked in_progress for later review.]`,
+              sessionId: acpSessionId,
+            }
+          } else {
+            // Spawn itself failed — safe to fall back to legacy gateway
+            logger.warn({ taskId: task.id, err: err.message }, 'ACP spawn failed, falling back to legacy gateway')
+            const invokeParams: Record<string, unknown> = {
+              message: prompt,
+              agentId: gatewayAgentId,
+              idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
+              deliver: false,
+            }
+            if (dispatchModel) invokeParams.model = dispatchModel
+
+            const finalResult = await runOpenClaw(
+              ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
+              { timeoutMs: 125_000 }
+            )
+            const finalPayload = parseGatewayJson(finalResult.stdout)
+              ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
+
+            agentResponse = parseAgentResponse(
+              finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
+            )
+            if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
+              agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
+            }
           }
         }
       } // end else (new session dispatch)

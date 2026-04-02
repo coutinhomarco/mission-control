@@ -1,4 +1,5 @@
 import { runOpenClaw } from './command'
+import { randomUUID } from 'node:crypto'
 
 export function parseGatewayJsonOutput(raw: string): unknown | null {
   const trimmed = String(raw || '').trim()
@@ -76,7 +77,7 @@ export async function spawnAcpSession(params: {
   cwd?: string
   timeoutSeconds?: number
 }): Promise<{ sessionId: string; spawnId: string }> {
-  const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+  const spawnId = `spawn-${Date.now()}-${randomUUID()}`
   const invokeParams: Record<string, unknown> = {
     task: params.task,
     runtime: 'acp',
@@ -114,29 +115,36 @@ export async function spawnAcpSession(params: {
  */
 export async function pollAcpSessionUntilComplete(
   sessionId: string,
-  timeoutMs = 180_000,
-  pollIntervalMs = 10000,
+  timeoutMs = 300_000,
+  pollIntervalMs = 10_000,
 ): Promise<string> {
   const deadline = Date.now() + timeoutMs
+  let firstPoll = true
 
   while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+    // First poll is immediate; subsequent polls wait the interval
+    if (!firstPoll) {
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+    }
+    firstPoll = false
 
     try {
       const history = await callOpenClawGateway<any>(
         'sessions_history',
-        { sessionKey: sessionId, limit: 10 },
+        { sessionKey: sessionId, limit: 50 },
         10_000,
       )
 
-      const messages = history?.messages ?? history ?? []
-      if (!Array.isArray(messages) || messages.length === 0) continue
+      const messages: any[] = Array.isArray(history?.messages) ? history.messages
+        : Array.isArray(history) ? history
+        : []
+      if (messages.length === 0) continue
 
       const lastMsg = messages[messages.length - 1]
       const status = String(lastMsg?.status ?? lastMsg?.state ?? '').toLowerCase()
-      const isDone = ['done', 'completed', 'finished', 'error', 'failed'].includes(status)
 
-      if (isDone || messages.length > 1) {
+      // Terminal states: completed/done = success, error/failed = throw
+      if (status === 'done' || status === 'completed') {
         const textParts: string[] = []
         for (const msg of messages) {
           if (msg.role === 'assistant' || msg.type === 'assistant') {
@@ -151,7 +159,15 @@ export async function pollAcpSessionUntilComplete(
         }
         return JSON.stringify(lastMsg)
       }
+
+      if (status === 'error' || status === 'failed') {
+        throw new Error(`ACP session ${sessionId} ended with status: ${status}`)
+      }
     } catch (err) {
+      // Only re-throw structural errors; network/parse errors are retried
+      if (err instanceof Error && err.message.includes(`ended with status`)) {
+        throw err
+      }
       console.warn(`pollAcpSessionUntilComplete: ${err}`)
     }
   }
