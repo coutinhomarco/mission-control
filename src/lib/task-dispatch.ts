@@ -743,7 +743,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
             return row?.metadata ? JSON.parse(row.metadata) : {}
           } catch { return {} }
         })()
-        const workspace = taskMeta?.workspace || taskMeta?.cwd || process.cwd()
+        const workspace = taskMeta?.workspace || taskMeta?.cwd || '/root/things/profitstack-next'
 
         let acpSessionId: string | null = null
 
