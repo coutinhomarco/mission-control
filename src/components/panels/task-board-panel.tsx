@@ -1229,6 +1229,14 @@ function TaskDetailModal({
   const mentionTargets = useMentionTargets()
   const [activeTab, setActiveTab] = useState<'details' | 'comments' | 'quality' | 'session'>('details')
   const [reviewer, setReviewer] = useState('aegis')
+  const [isClosing, setIsClosing] = useState(false)
+  const isClosingRef = useRef(false)
+
+  const closeModal = useCallback(() => {
+    isClosingRef.current = true
+    setIsClosing(true)
+    onClose()
+  }, [onClose])
 
   const fetchReviews = useCallback(async () => {
     try {
@@ -1242,15 +1250,22 @@ function TaskDetailModal({
   }, [task.id])
 
   const fetchComments = useCallback(async () => {
+    if (isClosingRef.current) return
     try {
       setLoadingComments(true)
       const response = await fetch(`/api/tasks/${task.id}/comments`)
+      if (response.status === 404) {
+        return
+      }
       if (!response.ok) throw new Error('Failed to fetch comments')
       const data = await response.json()
+      if (isClosingRef.current) return
       setComments(data.comments || [])
     } catch (error) {
+      if (isClosingRef.current) return
       setCommentError('Failed to load comments')
     } finally {
+      if (isClosingRef.current) return
       setLoadingComments(false)
     }
   }, [task.id])
@@ -1262,7 +1277,7 @@ function TaskDetailModal({
     fetchReviews()
   }, [fetchReviews])
   
-  useSmartPoll(fetchComments, 15000)
+  useSmartPoll(fetchComments, 15000, { enabled: !isClosing })
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -1405,7 +1420,7 @@ function TaskDetailModal({
     )
   }
 
-  const dialogRef = useFocusTrap(onClose)
+  const dialogRef = useFocusTrap(closeModal)
 
   const statusColors: Record<string, string> = {
     inbox: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/25',
@@ -1426,7 +1441,7 @@ function TaskDetailModal({
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={(e) => { if (e.target === e.currentTarget) closeModal() }}>
       <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="task-detail-title" className="bg-card border border-border rounded-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl shadow-black/30">
         {/* Header */}
         <div className="px-6 pt-5 pb-4 border-b border-border/50">
@@ -1462,6 +1477,9 @@ function TaskDetailModal({
                       const errorData = await res.json().catch(() => ({ error: 'Failed to delete task' }))
                       throw new Error(errorData.error || 'Failed to delete task')
                     }
+                    isClosingRef.current = true
+                    setIsClosing(true)
+                    onDelete()
                     onClose()
                   } catch (error) {
                     const errorMessage = error instanceof Error ? error.message : 'Failed to delete task'
@@ -1471,7 +1489,7 @@ function TaskDetailModal({
               >
                 <svg className="w-4 h-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M3 4h10M5.5 4V3a1 1 0 011-1h3a1 1 0 011 1v1M6.5 7v4M9.5 7v4M4.5 4l.5 9a1 1 0 001 1h4a1 1 0 001-1l.5-9" /></svg>
               </Button>
-              <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label={t('closeTaskDetails')} className="text-muted-foreground hover:text-foreground">
+              <Button variant="ghost" size="icon-sm" onClick={closeModal} aria-label={t('closeTaskDetails')} className="text-muted-foreground hover:text-foreground">
                 <svg className="w-4 h-4" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
               </Button>
             </div>
