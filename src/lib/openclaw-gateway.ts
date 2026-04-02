@@ -109,7 +109,6 @@ export async function spawnAcpSession(params: {
     'spawn',
     '--no-wait',
     '--session', sessionName,
-    '--cwd', cwd,
     '--format', 'quiet',
   ]
   if (params.model) {
