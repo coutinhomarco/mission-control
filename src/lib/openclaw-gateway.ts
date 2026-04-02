@@ -1,4 +1,4 @@
-import { runOpenClaw } from './command'
+import { runOpenClaw, runCommand } from './command'
 import { randomUUID } from 'node:crypto'
 
 export function parseGatewayJsonOutput(raw: string): unknown | null {
@@ -69,6 +69,13 @@ export async function callOpenClawGateway<T = unknown>(
  * Spawn an ACP session (e.g. Codex, Claude Code) via sessions_spawn.
  * Returns the sessionId immediately — the session runs asynchronously.
  */
+const ACPX_BIN = '/root/.nvm/versions/node/v22.22.2/lib/node_modules/openclaw/node_modules/.bin/acpx'
+
+/**
+ * Spawn an ACP session via `acpx spawn --no-wait`.
+ * This is non-blocking — returns immediately with the session name.
+ * The agent writes PR URL to /tmp/mc-task-{taskId}.pr when done.
+ */
 export async function spawnAcpSession(params: {
   task: string
   agentId?: string
@@ -76,37 +83,56 @@ export async function spawnAcpSession(params: {
   label?: string
   cwd?: string
   timeoutSeconds?: number
+  taskId?: number
 }): Promise<{ sessionId: string; spawnId: string }> {
-  const spawnId = `spawn-${Date.now()}-${randomUUID()}`
-  const invokeParams: Record<string, unknown> = {
-    task: params.task,
-    runtime: 'acp',
-    agentId: params.agentId || 'codex',
-    mode: 'session',
-    thread: false,
-    label: params.label || spawnId,
-  }
-  if (params.model) invokeParams.model = params.model
-  if (params.cwd) invokeParams.cwd = params.cwd
-  if (params.timeoutSeconds) invokeParams.runTimeoutSeconds = params.timeoutSeconds
+  const spawnId = `spawn-${Date.now()}-${randomUUID().slice(0, 8)}`
+  const sessionName = params.label || `mc-task-${params.taskId || 'unknown'}`
+  const cwd = params.cwd || process.cwd()
 
-  const result = await callOpenClawGateway<any>(
-    'sessions_spawn',
-    invokeParams,
-    15_000,
-  )
-
-  const sessionId: string | null =
-    typeof result?.sessionId === 'string' ? result.sessionId
-    : typeof result?.session_id === 'string' ? result.session_id
-    : typeof result?.sessionKey === 'string' ? result.sessionKey
+  // Build the prompt — include instruction to write PR URL to file
+  const prFile = `/tmp/mc-task-${params.taskId}.pr`
+  const instructionFile = params.taskId
+    ? `/root/.openclaw/workspace/agent-instructions/developer.md`
     : null
 
-  if (!sessionId) {
-    throw new Error(`sessions_spawn returned no sessionId: ${JSON.stringify(result)}`)
+  let fullTask = params.task
+  if (params.taskId) {
+    fullTask += `\n\nIMPORTANT: When you have created the Pull Request, write the PR URL to the file: ${prFile}`
+    if (instructionFile) {
+      fullTask += `\n\nAlso read these developer instructions: ${instructionFile}`
+    }
   }
 
-  return { sessionId, spawnId }
+  // Spawn via acpx CLI --no-wait (non-blocking)
+  const agent = params.agentId || 'codex'
+  const args = [
+    'spawn',
+    '--no-wait',
+    '--session', sessionName,
+    '--cwd', cwd,
+    '--format', 'quiet',
+  ]
+  if (params.model) {
+    args.push('--model', params.model)
+  }
+  // Add model from agent if available
+  if (agent === 'codex' && !params.model) {
+    args.push('--model', 'openai-codex/gpt-5.4')
+  }
+  args.push('--', agent)
+
+  const result = await runCommand(ACPX_BIN, args, {
+    cwd,
+    timeoutMs: 30_000,
+    input: fullTask,
+  })
+
+  // acpx spawn --no-wait returns immediately. Exit code 0 means spawn succeeded.
+  if (result.code !== 0) {
+    throw new Error(`acpx spawn failed: ${result.stderr || result.stdout}`)
+  }
+
+  return { sessionId: sessionName, spawnId }
 }
 
 /**

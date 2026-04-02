@@ -2,7 +2,7 @@ import { getDatabase, logAuditEvent } from './db'
 import { syncAgentsFromConfig } from './agent-sync'
 import { config, ensureDirExists } from './config'
 import { join, dirname } from 'path'
-import { readdirSync, statSync, unlinkSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from 'fs'
 import { logger } from './logger'
 import { processWebhookRetries } from './webhooks'
 import { syncClaudeSessions } from './claude-sessions'
@@ -12,6 +12,56 @@ import { syncSkillsFromDisk } from './skill-sync'
 import { syncLocalAgents } from './local-agent-sync'
 import { dispatchAssignedTasks, runAegisReviews, requeueStaleTasks, autoRouteInboxTasks } from './task-dispatch'
 import { spawnRecurringTasks } from './recurring-tasks'
+
+// PR file polling for non-blocking ACP dispatch
+async function checkPrFiles() {
+  const db = getDatabase()
+  const TICK_MS = 60_000
+
+  // Find in_progress tasks with pr_file metadata
+  const tasksWithPr = db.prepare(`
+    SELECT id, title, metadata
+    FROM tasks
+    WHERE status = 'in_progress'
+      AND metadata IS NOT NULL
+      AND metadata != ''
+  `).all() as Array<{ id: number; title: string; metadata: string }>
+
+  const checked: string[] = []
+  const updated: string[] = []
+
+  for (const row of tasksWithPr) {
+    try {
+      const meta = JSON.parse(row.metadata)
+      const prFile = meta?.pr_file
+      if (!prFile) continue
+
+      checked.push(`task-${row.id}`)
+
+      if (existsSync(prFile)) {
+        const prUrl = readFileSync(prFile, 'utf8').trim()
+        if (prUrl && prUrl.startsWith('http')) {
+          // PR detected — move to in_review
+          const updatedMeta = { ...meta, pr_url: prUrl }
+          db.prepare('UPDATE tasks SET status = ?, metadata = ?, updated_at = ? WHERE id = ?')
+            .run('in_review', JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
+          updated.push(`task-${row.id} → in_review (${prUrl})`)
+          // Remove PR file after processing
+          try { unlinkSync(prFile) } catch {}
+        }
+      }
+    } catch ( err) {
+      // Ignore parse errors
+    }
+  }
+
+  return {
+    ok: true,
+    message: checked.length > 0
+      ? `Checked ${checked.length} PR files: ${updated.length > 0 ? updated.join(', ') : 'none detected'}`
+      : 'No PR files to check'
+  }
+}
 
 const BACKUP_DIR = join(dirname(config.dbPath), 'backups')
 
@@ -398,6 +448,15 @@ export function initScheduler() {
     running: false,
   })
 
+  tasks.set('pr_check', {
+    name: 'PR File Checker',
+    intervalMs: TICK_MS, // Every 60s — poll /tmp/mc-task-{id}.pr files
+    lastRun: null,
+    nextRun: now + 15_000, // First check 15s after startup
+    enabled: true,
+    running: false,
+  })
+
   // Start the tick loop
   tickInterval = setInterval(tick, TICK_MS)
   logger.info('Scheduler initialized - backup at ~3AM, cleanup at ~4AM, heartbeat every 5m, webhook/claude/skill/local-agent/gateway-agent sync every 60s')
@@ -433,8 +492,9 @@ async function tick() {
       : id === 'aegis_review' ? 'general.aegis_review'
       : id === 'recurring_task_spawn' ? 'general.recurring_task_spawn'
       : id === 'stale_task_requeue' ? 'general.stale_task_requeue'
+      : id === 'pr_check' ? 'general.pr_check'
       : 'general.agent_heartbeat'
-    const defaultEnabled = id === 'agent_heartbeat' || id === 'webhook_retry' || id === 'claude_session_scan' || id === 'skill_sync' || id === 'local_agent_sync' || id === 'gateway_agent_sync' || id === 'task_dispatch' || id === 'aegis_review' || id === 'recurring_task_spawn' || id === 'stale_task_requeue'
+    const defaultEnabled = id === 'agent_heartbeat' || id === 'webhook_retry' || id === 'claude_session_scan' || id === 'skill_sync' || id === 'local_agent_sync' || id === 'gateway_agent_sync' || id === 'task_dispatch' || id === 'aegis_review' || id === 'recurring_task_spawn' || id === 'stale_task_requeue' || id === 'pr_check'
     if (!isSettingEnabled(settingKey, defaultEnabled)) continue
 
     task.running = true
@@ -457,6 +517,7 @@ async function tick() {
         : id === 'aegis_review' ? await runAegisReviews()
         : id === 'recurring_task_spawn' ? await spawnRecurringTasks()
         : id === 'stale_task_requeue' ? await requeueStaleTasks()
+        : id === 'pr_check' ? await checkPrFiles()
         : await runCleanup()
       task.lastResult = { ...result, timestamp: now }
     } catch (err: any) {
@@ -493,8 +554,9 @@ export function getSchedulerStatus() {
       : id === 'aegis_review' ? 'general.aegis_review'
       : id === 'recurring_task_spawn' ? 'general.recurring_task_spawn'
       : id === 'stale_task_requeue' ? 'general.stale_task_requeue'
+      : id === 'pr_check' ? 'general.pr_check'
       : 'general.agent_heartbeat'
-    const defaultEnabled = id === 'agent_heartbeat' || id === 'webhook_retry' || id === 'claude_session_scan' || id === 'skill_sync' || id === 'local_agent_sync' || id === 'gateway_agent_sync' || id === 'task_dispatch' || id === 'aegis_review' || id === 'recurring_task_spawn' || id === 'stale_task_requeue'
+    const defaultEnabled = id === 'agent_heartbeat' || id === 'webhook_retry' || id === 'claude_session_scan' || id === 'skill_sync' || id === 'local_agent_sync' || id === 'gateway_agent_sync' || id === 'task_dispatch' || id === 'aegis_review' || id === 'recurring_task_spawn' || id === 'stale_task_requeue' || id === 'pr_check'
     result.push({
       id,
       name: task.name,

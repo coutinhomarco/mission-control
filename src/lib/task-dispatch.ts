@@ -730,76 +730,71 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           sessionId: sendResult?.runId || targetSession,
         }
       } else {
-        // Spawn via ACP (sessions_spawn with runtime:"acp", mode:"session").
-        // This gives the agent a persistent session with context continuity.
-        const gatewayAgentId = resolveGatewayAgentId(task)
+        // Spawn via acpx spawn --no-wait (non-blocking).
+        // Agent writes PR URL to /tmp/mc-task-{id}.pr when done.
+        // A separate pr_check scheduler job detects PR creation and moves to in_review.
         const dispatchModel = classifyTaskModel(task)
+        const prFile = `/tmp/mc-task-${task.id}.pr`
+
+        // Get workspace from task metadata or use default
+        const taskMeta = (() => {
+          try {
+            const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
+            return row?.metadata ? JSON.parse(row.metadata) : {}
+          } catch { return {} }
+        })()
+        const workspace = taskMeta?.workspace || taskMeta?.cwd || process.cwd()
 
         let acpSessionId: string | null = null
-        let acpSpawned = false
 
         try {
           const spawnResult = await spawnAcpSession({
             task: prompt,
-            agentId: "codex",
+            agentId: 'codex',
             model: dispatchModel ?? undefined,
             label: `mc-task-${task.id}`,
-            timeoutSeconds: 300,
+            cwd: workspace,
+            taskId: task.id,
           })
           acpSessionId = spawnResult.sessionId
-          acpSpawned = true
-          logger.info({ taskId: task.id, sessionId: acpSessionId, agent: gatewayAgentId }, 'ACP session spawned, polling for completion')
+          logger.info({ taskId: task.id, sessionId: acpSessionId, workspace }, 'ACP session spawned via acpx, waiting for PR')
 
-          // Poll until the agent completes (5 min timeout, matches spawn)
-          const resultText = await pollAcpSessionUntilComplete(acpSessionId, 300_000, 10_000)
-          agentResponse = { text: resultText, sessionId: acpSessionId }
+          // Record spawn info in task metadata (pr_check will pick this up)
+          const updatedMeta = { ...taskMeta }
+          updatedMeta.dispatch_session_id = acpSessionId
+          updatedMeta.pr_file = prFile
+          updatedMeta.workspace = workspace
+          updatedMeta.dispatch_attempts = (updatedMeta.dispatch_attempts || 0) + 1
+          db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?')
+            .run(JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), task.id)
+
+          agentResponse = {
+            text: `[Task dispatched to Codex. Agent is working on branch task-${task.id}/... PR will be created and task moved to in_review when ready.]`,
+            sessionId: acpSessionId,
+          }
         } catch (err: any) {
-          if (acpSpawned && acpSessionId) {
-            // Session was spawned but polling failed. Do NOT fall back to legacy path —
-            // that would re-execute the same task. Instead record the session and
-            // mark the task as in_progress so it can be picked up by Aegis review later.
-            logger.warn({ taskId: task.id, sessionId: acpSessionId, err: err.message }, 'ACP poll failed — session still alive, recording for later review')
+          // Spawn failed — fall back to blocking gateway call
+          logger.warn({ taskId: task.id, err: err.message }, 'acpx spawn failed, falling back to gateway')
+          const invokeParams: Record<string, unknown> = {
+            message: prompt,
+            agentId: 'codex',
+            idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
+            deliver: false,
+          }
+          if (dispatchModel) invokeParams.model = dispatchModel
 
-            // Merge session into metadata and leave status as in_progress
-            const existingMeta = (() => {
-              try {
-                const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
-                return row?.metadata ? JSON.parse(row.metadata) : {}
-              } catch { return {} }
-            })()
-            existingMeta.dispatch_session_id = acpSessionId
-            existingMeta.acp_poll_error = err.message
-            db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?')
-              .run(JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id)
+          const finalResult = await runOpenClaw(
+            ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
+            { timeoutMs: 125_000 }
+          )
+          const finalPayload = parseGatewayJson(finalResult.stdout)
+            ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
 
-            agentResponse = {
-              text: `[ACP session ${acpSessionId} started but poll timed out. The agent is still working. Task marked in_progress for later review.]`,
-              sessionId: acpSessionId,
-            }
-          } else {
-            // Spawn itself failed — safe to fall back to legacy gateway
-            logger.warn({ taskId: task.id, err: err.message }, 'ACP spawn failed, falling back to legacy gateway')
-            const invokeParams: Record<string, unknown> = {
-              message: prompt,
-              agentId: "codex",
-              idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-              deliver: false,
-            }
-            if (dispatchModel) invokeParams.model = dispatchModel
-
-            const finalResult = await runOpenClaw(
-              ['gateway', 'call', 'agent', '--expect-final', '--timeout', '120000', '--params', JSON.stringify(invokeParams), '--json'],
-              { timeoutMs: 125_000 }
-            )
-            const finalPayload = parseGatewayJson(finalResult.stdout)
-              ?? parseGatewayJson(String((finalResult as any)?.stderr || ''))
-
-            agentResponse = parseAgentResponse(
-              finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
-            )
-            if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
-              agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
-            }
+          agentResponse = parseAgentResponse(
+            finalPayload?.result ? JSON.stringify(finalPayload.result) : finalResult.stdout
+          )
+          if (!agentResponse.sessionId && finalPayload?.result?.meta?.agentMeta?.sessionId) {
+            agentResponse.sessionId = finalPayload.result.meta.agentMeta.sessionId
           }
         }
       } // end else (new session dispatch)
