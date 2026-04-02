@@ -110,13 +110,6 @@ export async function spawnAcpSession(params: {
     '--no-wait',
     '--session', sessionName,
   ]
-  if (params.model) {
-    args.push('--model', params.model)
-  }
-  // Add model from agent if available
-  if (agent === 'codex' && !params.model) {
-    args.push('--model', 'openai-codex/gpt-5.4')
-  }
   args.push('--', agent)
 
   const result = await runCommand(ACPX_BIN, args, {

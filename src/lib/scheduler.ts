@@ -41,11 +41,11 @@ async function checkPrFiles() {
       if (existsSync(prFile)) {
         const prUrl = readFileSync(prFile, 'utf8').trim()
         if (prUrl && prUrl.startsWith('http')) {
-          // PR detected — move to in_review
+          // PR detected — move to review
           const updatedMeta = { ...meta, pr_url: prUrl }
           db.prepare('UPDATE tasks SET status = ?, metadata = ?, updated_at = ? WHERE id = ?')
-            .run('in_review', JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
-          updated.push(`task-${row.id} → in_review (${prUrl})`)
+            .run('review', JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
+          updated.push(`task-${row.id} → review (${prUrl})`)
           // Remove PR file after processing
           try { unlinkSync(prFile) } catch {}
         }

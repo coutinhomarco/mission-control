@@ -742,7 +742,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       } else {
         // Spawn via acpx spawn --no-wait (non-blocking).
         // Agent writes PR URL to /tmp/mc-task-{id}.pr when done.
-        // A separate pr_check scheduler job detects PR creation and moves to in_review.
+        // A separate pr_check scheduler job detects PR creation and moves to review.
         const dispatchModel = classifyTaskModel(task)
         const prFile = `/tmp/mc-task-${task.id}.pr`
 
@@ -779,7 +779,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
             .run(JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), task.id)
 
           agentResponse = {
-            text: `[Task dispatched to Codex. Agent is working on branch task-${task.id}/... PR will be created and task moved to in_review when ready.]`,
+            text: `[Task dispatched to Codex. Agent is working on branch task-${task.id}/... PR will be created and task moved to review when ready.]`,
             sessionId: acpSessionId,
           }
         } catch (err: any) {
