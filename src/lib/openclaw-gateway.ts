@@ -65,15 +65,17 @@ export async function callOpenClawGateway<T = unknown>(
   return payload as T
 }
 
-/**
- * Spawn an ACP session (e.g. Codex, Claude Code) via sessions_spawn.
- * Returns the sessionId immediately — the session runs asynchronously.
- */
 const ACPX_BIN = '/root/.nvm/versions/node/v22.22.2/lib/node_modules/openclaw/node_modules/.bin/acpx'
 
 /**
- * Spawn an ACP session via `acpx spawn --no-wait`.
- * This is non-blocking — returns immediately with the session name.
+ * Spawn an ACP session via acpx CLI.
+ *
+ * Flow: acpx codex sessions new --name <sessionName>  (creates named session)
+ *        acpx codex --no-wait --session <sessionName> "<prompt>"  (queues prompt, non-blocking)
+ *
+ * The agent process starts automatically when the session is created.
+ * We queue the work immediately after so the agent picks it up.
+ *
  * The agent writes PR URL to /tmp/mc-task-{taskId}.pr when done.
  */
 export async function spawnAcpSession(params: {
@@ -88,6 +90,7 @@ export async function spawnAcpSession(params: {
   const spawnId = `spawn-${Date.now()}-${randomUUID().slice(0, 8)}`
   const sessionName = params.label || `mc-task-${params.taskId || 'unknown'}`
   const cwd = params.cwd || process.cwd()
+  const agent = params.agentId || 'codex'
 
   // Build the prompt — include instruction to write PR URL to file
   const prFile = `/tmp/mc-task-${params.taskId}.pr`
@@ -103,24 +106,37 @@ export async function spawnAcpSession(params: {
     }
   }
 
-  // Spawn via acpx CLI --no-wait (non-blocking)
-  const agent = params.agentId || 'codex'
-  const args = [
-    'spawn',
-    '--no-wait',
-    '--session', sessionName,
-  ]
-  args.push('--', agent)
-
-  const result = await runCommand(ACPX_BIN, args, {
+  // Step 1: Create a named session.
+  // acpx codex sessions new --name <sessionName>
+  const createResult = await runCommand(ACPX_BIN, [
+    'codex', 'sessions', 'new', '--name', sessionName,
+  ], {
     cwd,
     timeoutMs: 30_000,
-    input: fullTask,
   })
 
-  // acpx spawn --no-wait returns immediately. Exit code 0 means spawn succeeded.
-  if (result.code !== 0) {
-    throw new Error(`acpx spawn failed: ${result.stderr || result.stdout}`)
+  if (createResult.code !== 0) {
+    throw new Error(`acpx codex sessions new failed: ${createResult.stderr || createResult.stdout}`)
+  }
+
+  // Step 2: Queue the prompt to the newly created session (non-blocking).
+  // acpx codex --no-wait --session <sessionName> "<prompt>"
+  const queueResult = await runCommand(ACPX_BIN, [
+    'codex',
+    '--no-wait',
+    '--session', sessionName,
+    fullTask,
+  ], {
+    cwd,
+    timeoutMs: 30_000,
+  })
+
+  // acpx queues the prompt asynchronously. Exit code 4 = queued successfully.
+  // Exit code 0 = agent was idle and picked it up immediately.
+  // Any other code is a real error.
+  const okCodes = [0, 4]
+  if (!okCodes.includes(queueResult.code ?? -1)) {
+    throw new Error(`acpx codex --no-wait failed: ${queueResult.stderr || queueResult.stdout}`)
   }
 
   return { sessionId: sessionName, spawnId }
