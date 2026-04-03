@@ -23,6 +23,7 @@ const settingDefinitions: Record<string, { category: string; description: string
   'retention.notifications_days': { category: 'retention', description: 'Days to keep notifications', default: String(config.retention.notifications) },
   'retention.pipeline_runs_days': { category: 'retention', description: 'Days to keep pipeline run history', default: String(config.retention.pipelineRuns) },
   'retention.token_usage_days': { category: 'retention', description: 'Days to keep token usage data', default: String(config.retention.tokenUsage) },
+  'retention.claude_sessions_days': { category: 'retention', description: 'Days to keep scanned local Claude session metadata', default: String(config.retention.claudeSessions) },
   'retention.gateway_sessions_days': { category: 'retention', description: 'Days to keep inactive gateway session metadata', default: String(config.retention.gatewaySessions) },
 
   // Gateway

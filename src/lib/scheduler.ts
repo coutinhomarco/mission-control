@@ -243,6 +243,23 @@ async function runCleanup(): Promise<{ ok: boolean; message: string }> {
       }
     }
 
+    if (ret.claudeSessions > 0) {
+      const cutoffSec = now - ret.claudeSessions * 86400
+      try {
+        const res = db.prepare(`
+          DELETE FROM claude_sessions
+          WHERE
+            CASE
+              WHEN last_message_at IS NOT NULL AND last_message_at != '' THEN unixepoch(last_message_at)
+              ELSE updated_at
+            END < ?
+        `).run(cutoffSec)
+        totalDeleted += res.changes
+      } catch {
+        // Table might not exist yet.
+      }
+    }
+
     // Clean token usage file
     if (ret.tokenUsage > 0) {
       try {

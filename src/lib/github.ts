@@ -15,6 +15,10 @@ export interface GitHubUser {
   avatar_url?: string
 }
 
+export interface GitHubAuthenticatedUser extends GitHubUser {
+  id?: number
+}
+
 export interface GitHubIssue {
   number: number
   title: string
@@ -293,6 +297,7 @@ export interface GitHubPullRequest {
   body: string | null
   state: 'open' | 'closed'
   merged: boolean
+  user: GitHubUser | null
   head: { ref: string; sha: string }
   base: { ref: string }
   html_url: string
@@ -320,6 +325,33 @@ export async function fetchPullRequests(
 
   const qs = searchParams.toString()
   const res = await githubFetch(`/repos/${repo}/pulls?${qs}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`GitHub API error ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
+/**
+ * Fetch a single pull request.
+ */
+export async function fetchPullRequest(
+  repo: string,
+  pullNumber: number
+): Promise<GitHubPullRequest> {
+  const res = await githubFetch(`/repos/${repo}/pulls/${pullNumber}`)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`GitHub API error ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
+/**
+ * Fetch the authenticated GitHub user for the current token.
+ */
+export async function fetchAuthenticatedUser(): Promise<GitHubAuthenticatedUser> {
+  const res = await githubFetch('/user')
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`GitHub API error ${res.status}: ${text}`)

@@ -6,19 +6,23 @@ const {
   metadataByTask,
   dispatchAttemptsByTask,
   mockRunCommand,
+  mockRunOpenClaw,
   mockCreateNotification,
   mockLogActivity,
   mockBroadcast,
   mockPrepare,
+  mockSpawnAcpSession,
 } = vi.hoisted(() => {
   const runCalls: Array<{ sql: string; args: unknown[] }> = []
   const taskRows: any[] = []
   const metadataByTask = new Map<number, string | null>()
   const dispatchAttemptsByTask = new Map<number, number>()
   const mockRunCommand = vi.fn()
+  const mockRunOpenClaw = vi.fn()
   const mockCreateNotification = vi.fn()
   const mockLogActivity = vi.fn()
   const mockBroadcast = vi.fn()
+  const mockSpawnAcpSession = vi.fn()
   const mockPrepare = vi.fn((sql: string) => ({
     all: vi.fn(() => sql.includes('FROM tasks t') ? taskRows : []),
     get: vi.fn((taskId?: number) => {
@@ -39,10 +43,12 @@ const {
     metadataByTask,
     dispatchAttemptsByTask,
     mockRunCommand,
+    mockRunOpenClaw,
     mockCreateNotification,
     mockLogActivity,
     mockBroadcast,
     mockPrepare,
+    mockSpawnAcpSession,
   }
 })
 
@@ -56,12 +62,12 @@ vi.mock('@/lib/db', () => ({
 
 vi.mock('@/lib/command', () => ({
   runCommand: mockRunCommand,
-  runOpenClaw: vi.fn(),
+  runOpenClaw: mockRunOpenClaw,
 }))
 
 vi.mock('@/lib/openclaw-gateway', () => ({
   callOpenClawGateway: vi.fn(),
-  spawnAcpSession: vi.fn(),
+  spawnAcpSession: mockSpawnAcpSession,
 }))
 
 vi.mock('@/lib/event-bus', () => ({
@@ -139,5 +145,53 @@ describe('dispatchAssignedTasks failure surfacing', () => {
       error_message: expect.stringContaining('network down'),
       dispatch_attempts: 1,
     }))
+  })
+
+  it('fails the dispatch when synchronous completion returns without a PR URL', async () => {
+    taskRows.push({
+      id: 42,
+      title: 'Inline completion without PR',
+      description: 'Agent forgot to open a PR',
+      status: 'assigned',
+      priority: 'high',
+      assigned_to: 'codex',
+      workspace_id: 1,
+      agent_name: 'codex',
+      agent_id: 7,
+      agent_config: JSON.stringify({ openclawId: 'codex' }),
+      ticket_prefix: null,
+      project_ticket_no: null,
+      project_id: null,
+      github_default_branch: null,
+      tags: undefined,
+    })
+    metadataByTask.set(42, JSON.stringify({ workspace: '/root/things/profitstack-next' }))
+    dispatchAttemptsByTask.set(42, 0)
+
+    mockRunCommand.mockResolvedValue({ stdout: '', stderr: '', code: 0 })
+    mockSpawnAcpSession.mockRejectedValue(new Error('spawn unavailable'))
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'Implemented the change and committed it locally.',
+      stderr: '',
+      code: 0,
+    })
+
+    const result = await dispatchAssignedTasks()
+
+    expect(result.ok).toBe(false)
+    expect(runCalls.some((call) =>
+      call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?')
+      && call.args[0] === 'assigned'
+      && String(call.args[1]).includes('cannot move to review without a PR URL')
+    )).toBe(true)
+    expect(mockCreateNotification).toHaveBeenCalledWith(
+      'codex',
+      'dispatch_error',
+      'Dispatch failed for [TASK-42] Inline completion without PR',
+      expect.stringContaining('cannot move to review without a PR URL'),
+      'task',
+      42,
+      1,
+    )
   })
 })

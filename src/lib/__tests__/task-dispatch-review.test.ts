@@ -4,6 +4,9 @@ const {
   mockRunOpenClaw,
   mockCallOpenClawGateway,
   mockSubmitPullRequestReview,
+  mockCreateIssueComment,
+  mockFetchPullRequest,
+  mockFetchAuthenticatedUser,
   mockBroadcast,
   mockLogActivity,
   mockPrepare,
@@ -15,6 +18,9 @@ const {
   const mockRunOpenClaw = vi.fn()
   const mockCallOpenClawGateway = vi.fn()
   const mockSubmitPullRequestReview = vi.fn()
+  const mockCreateIssueComment = vi.fn()
+  const mockFetchPullRequest = vi.fn()
+  const mockFetchAuthenticatedUser = vi.fn()
   const mockBroadcast = vi.fn()
   const mockLogActivity = vi.fn()
   const mockPrepare = vi.fn((sql: string) => ({
@@ -29,6 +35,9 @@ const {
     mockRunOpenClaw,
     mockCallOpenClawGateway,
     mockSubmitPullRequestReview,
+    mockCreateIssueComment,
+    mockFetchPullRequest,
+    mockFetchAuthenticatedUser,
     mockBroadcast,
     mockLogActivity,
     mockPrepare,
@@ -66,6 +75,9 @@ vi.mock('@/lib/config', () => ({
 
 vi.mock('@/lib/github', () => ({
   submitPullRequestReview: mockSubmitPullRequestReview,
+  createIssueComment: mockCreateIssueComment,
+  fetchPullRequest: mockFetchPullRequest,
+  fetchAuthenticatedUser: mockFetchAuthenticatedUser,
 }))
 
 import { runAegisReviews } from '@/lib/task-dispatch'
@@ -75,6 +87,8 @@ describe('runAegisReviews', () => {
     taskRows.length = 0
     runCalls.length = 0
     vi.clearAllMocks()
+    mockFetchPullRequest.mockResolvedValue({ user: { login: 'review-bot' } })
+    mockFetchAuthenticatedUser.mockResolvedValue({ login: 'mission-control' })
   })
 
   it('approves the PR, comments on the task, and moves it to done', async () => {
@@ -136,10 +150,116 @@ describe('runAegisReviews', () => {
     expect(mockSubmitPullRequestReview).toHaveBeenCalledWith('acme/app', 96, expect.objectContaining({
       event: 'REQUEST_CHANGES',
     }))
+    expect(mockSubmitPullRequestReview).toHaveBeenCalledWith('acme/app', 96, expect.objectContaining({
+      body: expect.stringContaining('Reason:\nFix the hover state'),
+    }))
     expect(mockCallOpenClawGateway).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       sessionKey: 'mc-task-9',
       message: expect.stringContaining('Do not open a new PR'),
     }), 125000)
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'in_progress')).toBe(true)
+  })
+
+  it('fails permanently when a review task has no pr_url metadata', async () => {
+    taskRows.push({
+      id: 11,
+      title: 'Broken review state',
+      description: 'Task was moved manually',
+      resolution: 'Done',
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({}),
+      github_repo: null,
+      dispatch_attempts: 0,
+    })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(false)
+    expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'failed')).toBe(true)
+    expect(mockBroadcast).toHaveBeenCalledWith('task.status_changed', expect.objectContaining({
+      id: 11,
+      status: 'failed',
+      previous_status: 'quality_review',
+      reason: 'invalid_review_state',
+    }))
+  })
+
+  it('falls back to a regular PR comment when the token owner authored the PR', async () => {
+    taskRows.push({
+      id: 12,
+      title: 'Self-authored PR',
+      description: 'Needs another pass',
+      resolution: 'Done',
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({ pr_url: 'https://github.com/acme/app/pull/108', dispatch_session_id: 'mc-task-12' }),
+      github_repo: 'acme/app',
+      dispatch_attempts: 1,
+    })
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'VERDICT: REJECTED\nNOTES: Fix the failing test',
+      stderr: '',
+      code: 0,
+    })
+    mockCallOpenClawGateway.mockResolvedValue({ status: 'ok' })
+    mockFetchPullRequest.mockResolvedValue({ user: { login: 'coutinhomarco' } })
+    mockFetchAuthenticatedUser.mockResolvedValue({ login: 'coutinhomarco' })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(true)
+    expect(mockSubmitPullRequestReview).not.toHaveBeenCalled()
+    expect(mockCreateIssueComment).toHaveBeenCalledWith(
+      'acme/app',
+      108,
+      expect.stringContaining('Reason:\nFix the failing test'),
+    )
+    expect(mockCallOpenClawGateway).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      sessionKey: 'mc-task-12',
+    }), 125000)
+  })
+
+  it('keeps rejected tasks in_progress even after many Aegis retries', async () => {
+    taskRows.push({
+      id: 13,
+      title: 'Retryable review task',
+      description: 'Needs another pass',
+      resolution: 'Done',
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({ pr_url: 'https://github.com/acme/app/pull/109', dispatch_session_id: 'mc-task-13' }),
+      github_repo: 'acme/app',
+      dispatch_attempts: 6,
+    })
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'VERDICT: REJECTED\nNOTES: Missing persistence for fnsku\nNeed coverage for the new parser',
+      stderr: '',
+      code: 0,
+    })
+    mockCallOpenClawGateway.mockResolvedValue({ status: 'ok' })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(true)
+    expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'in_progress')).toBe(true)
+    expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'failed')).toBe(false)
+    expect(mockBroadcast).toHaveBeenCalledWith('task.status_changed', expect.objectContaining({
+      id: 13,
+      status: 'in_progress',
+      reason: 'aegis_rejection',
+    }))
+    expect(mockSubmitPullRequestReview).toHaveBeenCalledWith('acme/app', 109, expect.objectContaining({
+      body: expect.stringContaining('Missing persistence for fnsku\nNeed coverage for the new parser'),
+    }))
   })
 })

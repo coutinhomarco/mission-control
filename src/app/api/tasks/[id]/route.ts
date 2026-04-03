@@ -39,6 +39,12 @@ function hasAegisApproval(
   return review?.status === 'approved'
 }
 
+function extractPrUrl(metadata: unknown): string {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return ''
+  const prUrl = (metadata as Record<string, unknown>).pr_url
+  return typeof prUrl === 'string' ? prUrl.trim() : ''
+}
+
 /**
  * GET /api/tasks/[id] - Get a specific task
  */
@@ -175,6 +181,22 @@ export async function PUT(
           { error: 'Aegis approval is required to move task to done.' },
           { status: 403 }
         )
+      }
+      if (normalizedStatus === 'review') {
+        const nextMetadata = metadata !== undefined ? metadata : (currentTask.metadata ? JSON.parse(currentTask.metadata) : {})
+        const nextResolution = resolution !== undefined ? resolution : currentTask.resolution
+        if (!extractPrUrl(nextMetadata)) {
+          return NextResponse.json(
+            { error: 'A PR URL in task metadata is required to move a task to review.' },
+            { status: 400 }
+          )
+        }
+        if (!String(nextResolution || '').trim()) {
+          return NextResponse.json(
+            { error: 'A resolution is required to move a task to review.' },
+            { status: 400 }
+          )
+        }
       }
       fieldsToUpdate.push('status = ?');
       updateParams.push(normalizedStatus);

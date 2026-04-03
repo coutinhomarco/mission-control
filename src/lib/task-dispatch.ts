@@ -4,7 +4,7 @@ import { callOpenClawGateway, spawnAcpSession } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
-import { submitPullRequestReview } from './github'
+import { createIssueComment, fetchAuthenticatedUser, fetchPullRequest, submitPullRequestReview } from './github'
 
 interface DispatchableTask {
   id: number
@@ -107,6 +107,12 @@ function getTaskReference(task: Pick<DispatchableTask, 'id' | 'ticket_prefix' | 
   return task.ticket_prefix && task.project_ticket_no
     ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
     : `TASK-${task.id}`
+}
+
+function isNonRetriableReviewError(errorMsg: string): boolean {
+  return errorMsg.includes('has no pr_url in metadata')
+    || errorMsg.includes('has an invalid PR URL')
+    || errorMsg.includes('no GitHub repo is configured')
 }
 
 function parsePorcelainPath(line: string): string {
@@ -248,6 +254,10 @@ export function buildDispatchFailureComment(
     '',
     errorMsg.substring(0, 5000),
   ].join('\n')
+}
+
+export function buildMissingPrReviewError(task: Pick<DispatchableTask, 'id' | 'title' | 'ticket_prefix' | 'project_ticket_no'>): string {
+  return `Task [${getTaskReference(task)}] ${task.title} cannot move to review without a PR URL in metadata`
 }
 
 export function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
@@ -560,8 +570,9 @@ function buildReviewPrompt(task: ReviewableTask): string {
 function parseReviewVerdict(text: string): { status: 'approved' | 'rejected'; notes: string } {
   const upper = text.toUpperCase()
   const status = upper.includes('VERDICT: APPROVED') ? 'approved' as const : 'rejected' as const
-  const notesMatch = text.match(/NOTES:\s*(.+)/i)
-  const notes = notesMatch?.[1]?.trim().substring(0, 2000) || (status === 'approved' ? 'Quality check passed' : 'Quality check failed')
+  const notesMatch = text.match(/NOTES:\s*([\s\S]+?)\s*$/i)
+  const extractedNotes = notesMatch?.[1]?.trim() || ''
+  const notes = extractedNotes.substring(0, 2000) || (status === 'approved' ? 'Quality check passed' : 'Quality check failed')
   return { status, notes }
 }
 
@@ -591,6 +602,7 @@ export function buildAegisReviewComment(
     `Aegis Review: ${verdict}`,
     `PR: ${prUrl}`,
     '',
+    status === 'approved' ? 'Summary:' : 'Reason:',
     notes.trim(),
   ].join('\n')
 }
@@ -636,6 +648,30 @@ async function sendTaskPromptToSession(taskId: number, sessionKey: string, messa
   if (status !== 'started' && status !== 'ok' && status !== 'in_flight') {
     throw new Error(`chat.send to session ${sessionKey} returned status: ${status}`)
   }
+}
+
+async function publishAegisReview(
+  repo: string,
+  pullNumber: number,
+  review: {
+    body: string
+    event: 'APPROVE' | 'REQUEST_CHANGES'
+  },
+): Promise<'review' | 'comment'> {
+  const [pr, viewer] = await Promise.all([
+    fetchPullRequest(repo, pullNumber),
+    fetchAuthenticatedUser(),
+  ])
+
+  const prAuthor = String(pr.user?.login || '').trim().toLowerCase()
+  const viewerLogin = String(viewer.login || '').trim().toLowerCase()
+  if (prAuthor && viewerLogin && prAuthor === viewerLogin) {
+    await createIssueComment(repo, pullNumber, review.body)
+    return 'comment'
+  }
+
+  await submitPullRequestReview(repo, pullNumber, review)
+  return 'review'
 }
 
 /**
@@ -728,7 +764,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 
       const verdict = parseReviewVerdict(agentResponse.text)
       const reviewComment = buildAegisReviewComment(verdict.status, verdict.notes, prUrl)
-      await submitPullRequestReview(repo, parsedPr.pullNumber, {
+      const reviewDelivery = await publishAegisReview(repo, parsedPr.pullNumber, {
         body: reviewComment,
         event: verdict.status === 'approved' ? 'APPROVE' : 'REQUEST_CHANGES',
       })
@@ -754,49 +790,32 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
           previous_status: 'quality_review',
         })
       } else {
-        // Rejected: check dispatch_attempts to decide next status
         const now = Math.floor(Date.now() / 1000)
         const newAttempts = (task.dispatch_attempts ?? 0) + 1
-        const maxAegisRetries = 3
-
-        if (newAttempts >= maxAegisRetries) {
-          // Too many rejections — move to failed
-          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?')
-            .run('failed', `Aegis rejected ${newAttempts} times. Last: ${verdict.notes}`, newAttempts, now, task.id)
-
-          eventBus.broadcast('task.status_changed', {
-            id: task.id,
-            status: 'failed',
-            previous_status: 'quality_review',
-            error_message: `Aegis rejected ${newAttempts} times`,
-            reason: 'max_aegis_retries_exceeded',
-          })
-        } else {
-          const targetSession = getReusableTaskSession(metadata)
-          if (!targetSession) {
-            throw new Error(`Task ${task.id} was rejected but has no reusable developer session`)
-          }
-          const updatedMeta = {
-            ...metadata,
-            target_session: targetSession,
-            dispatch_session_id: targetSession,
-            pr_url: prUrl,
-            pr_file: metadata.pr_file || `/tmp/mc-task-${task.id}.pr`,
-          }
-          const reworkPrompt = buildReworkPrompt(task, verdict.notes, prUrl)
-          await sendTaskPromptToSession(task.id, targetSession, reworkPrompt)
-
-          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?')
-            .run('in_progress', `Aegis requested changes: ${verdict.notes}`, newAttempts, JSON.stringify(updatedMeta), now, task.id)
-
-          eventBus.broadcast('task.status_changed', {
-            id: task.id,
-            status: 'in_progress',
-            previous_status: 'quality_review',
-            error_message: `Aegis requested changes: ${verdict.notes}`,
-            reason: 'aegis_rejection',
-          })
+        const targetSession = getReusableTaskSession(metadata)
+        if (!targetSession) {
+          throw new Error(`Task ${task.id} was rejected but has no reusable developer session`)
         }
+        const updatedMeta = {
+          ...metadata,
+          target_session: targetSession,
+          dispatch_session_id: targetSession,
+          pr_url: prUrl,
+          pr_file: metadata.pr_file || `/tmp/mc-task-${task.id}.pr`,
+        }
+        const reworkPrompt = buildReworkPrompt(task, verdict.notes, prUrl)
+        await sendTaskPromptToSession(task.id, targetSession, reworkPrompt)
+
+        db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?')
+          .run('in_progress', `Aegis requested changes: ${verdict.notes}`, newAttempts, JSON.stringify(updatedMeta), now, task.id)
+
+        eventBus.broadcast('task.status_changed', {
+          id: task.id,
+          status: 'in_progress',
+          previous_status: 'quality_review',
+          error_message: `Aegis requested changes: ${verdict.notes}`,
+          reason: 'aegis_rejection',
+        })
       }
 
       db_helpers.logActivity(
@@ -805,7 +824,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
         task.id,
         'aegis',
         `Aegis ${verdict.status} task "${task.title}": ${verdict.notes.substring(0, 200)}`,
-        { verdict: verdict.status, notes: verdict.notes },
+        { verdict: verdict.status, notes: verdict.notes, delivery: reviewDelivery },
         task.workspace_id
       )
 
@@ -815,15 +834,28 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       const errorMsg = err.message || 'Unknown error'
       logger.error({ taskId: task.id, err }, 'Aegis review failed')
 
-      // Revert to review so it can be retried
-      db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-        .run('review', Math.floor(Date.now() / 1000), task.id)
+      if (isNonRetriableReviewError(errorMsg)) {
+        db.prepare('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
+          .run('failed', errorMsg.substring(0, 500), Math.floor(Date.now() / 1000), task.id)
 
-      eventBus.broadcast('task.status_changed', {
-        id: task.id,
-        status: 'review',
-        previous_status: 'quality_review',
-      })
+        eventBus.broadcast('task.status_changed', {
+          id: task.id,
+          status: 'failed',
+          previous_status: 'quality_review',
+          error_message: errorMsg.substring(0, 500),
+          reason: 'invalid_review_state',
+        })
+      } else {
+        // Revert to review so transient errors can be retried
+        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
+          .run('review', Math.floor(Date.now() / 1000), task.id)
+
+        eventBus.broadcast('task.status_changed', {
+          id: task.id,
+          status: 'review',
+          previous_status: 'quality_review',
+        })
+      }
 
       results.push({ id: task.id, verdict: 'error', error: errorMsg.substring(0, 100) })
     }
@@ -1153,6 +1185,10 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         results.push({ id: task.id, success: true })
         logger.info({ taskId: task.id, agent: task.agent_name, sessionId: agentResponse.sessionId }, 'Task dispatched asynchronously; awaiting PR')
         continue
+      }
+
+      if (!String(existingMeta.pr_url || '').trim()) {
+        throw new Error(buildMissingPrReviewError(task))
       }
 
       // Update task: status → review, set outcome
