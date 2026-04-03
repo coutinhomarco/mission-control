@@ -2324,8 +2324,13 @@ function EditTaskModal({
     project_id: task.project_id ? String(task.project_id) : (projects[0]?.id ? String(projects[0].id) : ''),
     assigned_to: task.assigned_to || '',
     tags: task.tags ? task.tags.join(', ') : '',
-    target_session: task.metadata?.target_session || '',
+    target_session: (task.metadata?.target_session as string) || '',
+    pr_url: (task.metadata?.pr_url as string) || '',
+    implementation_repo: (task.metadata?.implementation_repo as string) || '',
+    code_location: (task.metadata?.code_location as string) || '',
   })
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
   const mentionTargets = useMentionTargets()
   const agentSessions = useAgentSessions(formData.assigned_to || undefined)
 
@@ -2334,6 +2339,8 @@ function EditTaskModal({
 
     if (!formData.title.trim()) return
 
+    setSaveError(null)
+    setSaving(true)
     try {
       const existingMeta = task.metadata || {}
       const updatedMeta = { ...existingMeta }
@@ -2342,14 +2349,32 @@ function EditTaskModal({
       } else {
         delete updatedMeta.target_session
       }
+      if (formData.pr_url) {
+        updatedMeta.pr_url = formData.pr_url
+      } else {
+        delete updatedMeta.pr_url
+      }
+      if (formData.implementation_repo) {
+        updatedMeta.implementation_repo = formData.implementation_repo
+      } else {
+        delete updatedMeta.implementation_repo
+      }
+      if (formData.code_location) {
+        updatedMeta.code_location = formData.code_location
+      } else {
+        delete updatedMeta.code_location
+      }
 
       const response = await fetch(`/api/tasks/${task.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...formData,
+          title: formData.title,
+          description: formData.description,
+          priority: formData.priority,
+          status: formData.status,
           project_id: formData.project_id ? Number(formData.project_id) : undefined,
-          tags: formData.tags ? formData.tags.split(',').map(t => t.trim()) : [],
+          tags: formData.tags ? formData.tags.split(',').map(t => t.trim()).filter(Boolean) : [],
           assigned_to: formData.assigned_to || undefined,
           metadata: updatedMeta,
         })
@@ -2357,13 +2382,17 @@ function EditTaskModal({
 
       if (!response.ok) {
         const errorData = await response.json()
-        const errorMsg = errorData.details ? errorData.details.join(', ') : errorData.error
-        throw new Error(errorMsg)
+        const errorMsg = errorData.details ? errorData.details.join(', ') : (errorData.error || 'Failed to save')
+        setSaveError(errorMsg)
+        return
       }
 
       onUpdated()
     } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Failed to save task')
       log.error('Error updating task:', error)
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -2371,9 +2400,15 @@ function EditTaskModal({
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="edit-task-title" className="bg-card border border-border rounded-lg max-w-md w-full">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="edit-task-title" className="bg-card border border-border rounded-lg max-w-md w-full max-h-[90vh] overflow-y-auto">
         <form onSubmit={handleSubmit} className="p-6">
           <h3 id="edit-task-title" className="text-xl font-bold text-foreground mb-4">{t('editTask')}</h3>
+
+          {saveError && (
+            <div className="mb-4 px-3 py-2 bg-destructive/10 border border-destructive/30 rounded-md text-sm text-destructive">
+              {saveError}
+            </div>
+          )}
 
           <div className="space-y-4">
             <div>
@@ -2500,11 +2535,50 @@ function EditTaskModal({
                 placeholder="frontend, urgent, bug"
               />
             </div>
+
+            <div className="border-t border-border pt-4">
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">Metadata</p>
+              <div className="space-y-3">
+                <div>
+                  <label htmlFor="edit-pr-url" className="block text-sm text-muted-foreground mb-1">PR URL</label>
+                  <input
+                    id="edit-pr-url"
+                    type="text"
+                    value={formData.pr_url}
+                    onChange={(e) => setFormData(prev => ({ ...prev, pr_url: e.target.value }))}
+                    className="w-full bg-surface-1 text-foreground border border-border rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-primary/50"
+                    placeholder="https://github.com/org/repo/pull/123"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="edit-impl-repo" className="block text-sm text-muted-foreground mb-1">Implementation Repo</label>
+                  <input
+                    id="edit-impl-repo"
+                    type="text"
+                    value={formData.implementation_repo}
+                    onChange={(e) => setFormData(prev => ({ ...prev, implementation_repo: e.target.value }))}
+                    className="w-full bg-surface-1 text-foreground border border-border rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-primary/50"
+                    placeholder="org/repo"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="edit-code-location" className="block text-sm text-muted-foreground mb-1">Code Location</label>
+                  <input
+                    id="edit-code-location"
+                    type="text"
+                    value={formData.code_location}
+                    onChange={(e) => setFormData(prev => ({ ...prev, code_location: e.target.value }))}
+                    className="w-full bg-surface-1 text-foreground border border-border rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-primary/50"
+                    placeholder="/path/to/code or src/module"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
 
           <div className="flex gap-3 mt-6">
-            <Button type="submit" className="flex-1">
-              {t('saveChanges')}
+            <Button type="submit" disabled={saving} className="flex-1">
+              {saving ? 'Saving...' : t('saveChanges')}
             </Button>
             <Button type="button" variant="secondary" onClick={onClose} className="flex-1">
               {t('cancel')}
