@@ -13,6 +13,7 @@ import { syncLocalAgents } from './local-agent-sync'
 import { dispatchAssignedTasks, runAegisReviews, requeueStaleTasks, autoRouteInboxTasks } from './task-dispatch'
 import { spawnRecurringTasks } from './recurring-tasks'
 import { closeAcpSession } from './openclaw-gateway'
+import { runOpenClaw } from './command'
 
 const ACPX_SESSIONS_DIR = '/root/.acpx/sessions'
 
@@ -296,8 +297,27 @@ async function runCleanup(): Promise<{ ok: boolean; message: string }> {
     }
 
     if (ret.gatewaySessions > 0) {
-      const sessionCleanup = pruneGatewaySessionsOlderThan(ret.gatewaySessions)
-      totalDeleted += sessionCleanup.deleted
+      try {
+        const result = await runOpenClaw(
+          ['sessions', 'cleanup', '--all-agents', '--enforce', '--fix-missing', '--json'],
+          { timeoutMs: 120000 }
+        )
+        const payload = JSON.parse(result.stdout || '{}') as {
+          stores?: Array<{
+            missing?: number
+            pruned?: number
+            capped?: number
+          }>
+        }
+        const stores = Array.isArray(payload.stores) ? payload.stores : []
+        totalDeleted += stores.reduce((sum, store) => (
+          sum + Number(store?.missing || 0) + Number(store?.pruned || 0) + Number(store?.capped || 0)
+        ), 0)
+      } catch (err) {
+        logger.warn({ err }, 'OpenClaw native session cleanup failed; falling back to Mission Control pruning')
+        const sessionCleanup = pruneGatewaySessionsOlderThan(ret.gatewaySessions)
+        totalDeleted += sessionCleanup.deleted
+      }
     }
 
     if (totalDeleted > 0) {

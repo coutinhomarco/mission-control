@@ -8,12 +8,14 @@ const {
   prepareMock,
   broadcastMock,
   closeAcpSessionMock,
+  runOpenClawMock,
 } = vi.hoisted(() => ({
   allMock: vi.fn(),
   runMock: vi.fn(),
   prepareMock: vi.fn(),
   broadcastMock: vi.fn(),
   closeAcpSessionMock: vi.fn(),
+  runOpenClawMock: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -23,13 +25,29 @@ vi.mock('@/lib/db', () => ({
 vi.mock('@/lib/event-bus', () => ({ eventBus: { broadcast: broadcastMock } }))
 vi.mock('@/lib/openclaw-gateway', () => ({ closeAcpSession: closeAcpSessionMock }))
 vi.mock('@/lib/agent-sync', () => ({ syncAgentsFromConfig: vi.fn() }))
-vi.mock('@/lib/config', () => ({ config: { dbPath: '/tmp/mission-control-test.db' }, ensureDirExists: vi.fn() }))
+vi.mock('@/lib/config', () => ({
+  config: {
+    dbPath: '/tmp/mission-control-test.db',
+    tokensPath: '/tmp/mission-control-token-usage.json',
+    retention: {
+      activities: 90,
+      auditLog: 365,
+      notifications: 60,
+      pipelineRuns: 90,
+      tokenUsage: 0,
+      claudeSessions: 30,
+      gatewaySessions: 90,
+    },
+  },
+  ensureDirExists: vi.fn(),
+}))
 vi.mock('@/lib/logger', () => ({ logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() } }))
 vi.mock('@/lib/webhooks', () => ({ processWebhookRetries: vi.fn() }))
 vi.mock('@/lib/claude-sessions', () => ({ syncClaudeSessions: vi.fn() }))
 vi.mock('@/lib/sessions', () => ({ pruneGatewaySessionsOlderThan: vi.fn(), getAgentLiveStatuses: vi.fn() }))
 vi.mock('@/lib/skill-sync', () => ({ syncSkillsFromDisk: vi.fn() }))
 vi.mock('@/lib/local-agent-sync', () => ({ syncLocalAgents: vi.fn() }))
+vi.mock('@/lib/command', () => ({ runOpenClaw: runOpenClawMock }))
 vi.mock('@/lib/task-dispatch', () => ({
   dispatchAssignedTasks: vi.fn(),
   runAegisReviews: vi.fn(),
@@ -38,7 +56,7 @@ vi.mock('@/lib/task-dispatch', () => ({
 }))
 vi.mock('@/lib/recurring-tasks', () => ({ spawnRecurringTasks: vi.fn() }))
 
-import { checkPrFiles, extractFinalAgentMessageFromAcpStream } from '@/lib/scheduler'
+import { checkPrFiles, extractFinalAgentMessageFromAcpStream, triggerTask } from '@/lib/scheduler'
 
 describe('extractFinalAgentMessageFromAcpStream', () => {
   it('returns the final completed assistant turn from an ACP stream', () => {
@@ -102,5 +120,34 @@ describe('checkPrFiles', () => {
       previous_status: 'in_progress',
     }))
     expect(closeAcpSessionMock).toHaveBeenCalledWith('mc-task-12', '/root/things/profitstack-next')
+  })
+})
+
+describe('auto_cleanup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    runOpenClawMock.mockResolvedValue({
+      stdout: JSON.stringify({
+        stores: [
+          { missing: 1, pruned: 2, capped: 0 },
+          { missing: 0, pruned: 0, capped: 3 },
+        ],
+      }),
+      stderr: '',
+      code: 0,
+    })
+
+    prepareMock.mockReturnValue({ run: vi.fn(() => ({ changes: 0 })) })
+  })
+
+  it('uses OpenClaw native session cleanup during auto cleanup', async () => {
+    const result = await triggerTask('auto_cleanup')
+
+    expect(result.ok).toBe(true)
+    expect(runOpenClawMock).toHaveBeenCalledWith(
+      ['sessions', 'cleanup', '--all-agents', '--enforce', '--fix-missing', '--json'],
+      expect.objectContaining({ timeoutMs: 120000 })
+    )
+    expect(result.message).toContain('Cleaned 6 stale records')
   })
 })
