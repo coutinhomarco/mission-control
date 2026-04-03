@@ -12,6 +12,7 @@ const {
   mockBroadcast,
   mockPrepare,
   mockSpawnAcpSession,
+  mockCloseAcpSession,
 } = vi.hoisted(() => {
   const runCalls: Array<{ sql: string; args: unknown[] }> = []
   const taskRows: any[] = []
@@ -23,6 +24,7 @@ const {
   const mockLogActivity = vi.fn()
   const mockBroadcast = vi.fn()
   const mockSpawnAcpSession = vi.fn()
+  const mockCloseAcpSession = vi.fn()
   const mockPrepare = vi.fn((sql: string) => ({
     all: vi.fn(() => sql.includes('FROM tasks t') ? taskRows : []),
     get: vi.fn((taskId?: number) => {
@@ -49,6 +51,7 @@ const {
     mockBroadcast,
     mockPrepare,
     mockSpawnAcpSession,
+    mockCloseAcpSession,
   }
 })
 
@@ -68,6 +71,7 @@ vi.mock('@/lib/command', () => ({
 vi.mock('@/lib/openclaw-gateway', () => ({
   callOpenClawGateway: vi.fn(),
   spawnAcpSession: mockSpawnAcpSession,
+  closeAcpSession: mockCloseAcpSession,
 }))
 
 vi.mock('@/lib/event-bus', () => ({
@@ -193,5 +197,43 @@ describe('dispatchAssignedTasks failure surfacing', () => {
       42,
       1,
     )
+  })
+
+  it('closes any stale task-linked ACP session before spawning a fresh developer session', async () => {
+    taskRows.push({
+      id: 43,
+      title: 'Fresh dispatch only',
+      description: 'Avoid session reuse',
+      status: 'assigned',
+      priority: 'high',
+      assigned_to: 'codex',
+      workspace_id: 1,
+      agent_name: 'codex',
+      agent_id: 7,
+      agent_config: JSON.stringify({ openclawId: 'codex' }),
+      ticket_prefix: null,
+      project_ticket_no: null,
+      project_id: null,
+      github_default_branch: null,
+      tags: undefined,
+    })
+    metadataByTask.set(43, JSON.stringify({
+      workspace: '/root/things/profitstack-next',
+      target_session: 'stale-session',
+      dispatch_session_id: 'stale-session',
+    }))
+    dispatchAttemptsByTask.set(43, 0)
+
+    mockRunCommand.mockResolvedValue({ stdout: '', stderr: '', code: 0 })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-43', spawnId: 'spawn-43' })
+
+    const result = await dispatchAssignedTasks()
+
+    expect(result.ok).toBe(true)
+    expect(mockCloseAcpSession).toHaveBeenCalledWith('stale-session', '/root/things/profitstack-next')
+    expect(mockSpawnAcpSession).toHaveBeenCalledWith(expect.objectContaining({
+      label: 'mc-task-43',
+      cwd: '/root/things/profitstack-next',
+    }))
   })
 })

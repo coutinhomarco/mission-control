@@ -1,6 +1,6 @@
 import { getDatabase, db_helpers } from './db'
 import { runCommand, runOpenClaw } from './command'
-import { callOpenClawGateway, spawnAcpSession } from './openclaw-gateway'
+import { callOpenClawGateway, closeAcpSession, spawnAcpSession } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
@@ -508,6 +508,10 @@ interface TaskMetadata {
   cwd?: string
 }
 
+function getTaskWorkspace(metadata: TaskMetadata): string {
+  return metadata.workspace || metadata.cwd || '/root/things/profitstack-next'
+}
+
 function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
   if (task.agent_config) {
     try {
@@ -522,6 +526,16 @@ function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
     'test-claude': 'claude',
   }
   return agentIdMap[agentName] || 'main'
+}
+
+function resolveGatewayAgentIdForDeveloper(task: Pick<ReviewableTask, 'assigned_to' | 'agent_config'>): string {
+  if (task.agent_config) {
+    try {
+      const cfg = JSON.parse(task.agent_config)
+      if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
+    } catch { /* ignore */ }
+  }
+  return String(task.assigned_to || '').trim() || 'main'
 }
 
 function buildReviewPrompt(task: ReviewableTask): string {
@@ -792,19 +806,31 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       } else {
         const now = Math.floor(Date.now() / 1000)
         const newAttempts = (task.dispatch_attempts ?? 0) + 1
-        const targetSession = getReusableTaskSession(metadata)
-        if (!targetSession) {
-          throw new Error(`Task ${task.id} was rejected but has no reusable developer session`)
+        const priorSession = getReusableTaskSession(metadata)
+        const workspace = getTaskWorkspace(metadata)
+        if (priorSession) {
+          try {
+            await closeAcpSession(priorSession, workspace)
+          } catch (err) {
+            logger.warn({ taskId: task.id, sessionId: priorSession, err }, 'Failed to close prior developer session before rework')
+          }
         }
+        const spawned = await spawnAcpSession({
+          task: buildReworkPrompt(task, verdict.notes, prUrl),
+          agentId: resolveGatewayAgentIdForDeveloper(task),
+          label: `mc-task-${task.id}-rework`,
+          cwd: workspace,
+          taskId: task.id,
+        })
+        const targetSession = spawned.sessionId
         const updatedMeta = {
           ...metadata,
           target_session: targetSession,
           dispatch_session_id: targetSession,
           pr_url: prUrl,
           pr_file: metadata.pr_file || `/tmp/mc-task-${task.id}.pr`,
+          workspace,
         }
-        const reworkPrompt = buildReworkPrompt(task, verdict.notes, prUrl)
-        await sendTaskPromptToSession(task.id, targetSession, reworkPrompt)
 
         db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?')
           .run('in_progress', `Aegis requested changes: ${verdict.notes}`, newAttempts, JSON.stringify(updatedMeta), now, task.id)
@@ -1017,51 +1043,33 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
       const prompt = buildTaskPrompt(task, rejectionFeedback)
 
-      // Check if task has a target session specified in metadata
       const taskMeta = (() => {
         try {
           const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
           return row?.metadata ? JSON.parse(row.metadata) : {}
         } catch { return {} }
       })()
-      const targetSession: string | null = typeof taskMeta?.target_session === 'string' && taskMeta.target_session
-        ? taskMeta.target_session
-        : null
       const dispatchModel = classifyTaskModel(task)
       const resolvedAgentId = resolveGatewayAgentId(task)
       const prFile = `/tmp/mc-task-${task.id}.pr`
       workspace = taskMeta?.workspace || taskMeta?.cwd || workspace
+      const priorSession = getReusableTaskSession(taskMeta)
 
       let agentResponse: AgentResponseParsed
       let finalizeImmediately = true
       const useDirectApi = !isGatewayAvailable() && getAnthropicApiKey()
 
-      if (useDirectApi && !targetSession) {
+      if (priorSession) {
+        try {
+          await closeAcpSession(priorSession, workspace)
+        } catch (err) {
+          logger.warn({ taskId: task.id, sessionId: priorSession, err }, 'Failed to close prior task session before fresh dispatch')
+        }
+      }
+
+      if (useDirectApi) {
         // Direct Claude API dispatch — no gateway needed
         agentResponse = await callClaudeDirectly(task, prompt)
-      } else if (targetSession) {
-        // Dispatch to a specific existing session via chat.send
-        logger.info({ taskId: task.id, targetSession, agent: task.agent_name }, 'Dispatching task to targeted session')
-        const sendResult = await callOpenClawGateway<any>(
-          'chat.send',
-          {
-            sessionKey: targetSession,
-            message: prompt,
-            idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-            deliver: false,
-          },
-          125_000,
-        )
-        const status = String(sendResult?.status || '').toLowerCase()
-        if (status !== 'started' && status !== 'ok' && status !== 'in_flight') {
-          throw new Error(`chat.send to session ${targetSession} returned status: ${status}`)
-        }
-        // chat.send is fire-and-forget; we record the session but won't get inline response text
-        finalizeImmediately = false
-        agentResponse = {
-          text: `Task dispatched to existing session ${targetSession}. The agent will process it within that session context.`,
-          sessionId: targetSession,
-        }
       } else {
         // Spawn via acpx spawn --no-wait (non-blocking).
         // Agent writes PR URL to /tmp/mc-task-{id}.pr when done.
@@ -1142,13 +1150,12 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         existingMeta.dispatch_session_id = agentResponse.sessionId
       }
       if (!finalizeImmediately) {
-        if (agentResponse.sessionId) {
-          existingMeta.target_session = agentResponse.sessionId
-        }
+        delete existingMeta.target_session
         existingMeta.pr_file = prFile
         existingMeta.workspace = workspace
       } else {
         delete existingMeta.pr_file
+        delete existingMeta.target_session
       }
 
       if (!finalizeImmediately && shouldAwaitPrBeforeReview(existingMeta)) {

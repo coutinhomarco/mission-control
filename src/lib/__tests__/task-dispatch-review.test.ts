@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   mockRunOpenClaw,
   mockCallOpenClawGateway,
+  mockSpawnAcpSession,
+  mockCloseAcpSession,
   mockSubmitPullRequestReview,
   mockCreateIssueComment,
   mockFetchPullRequest,
@@ -17,6 +19,8 @@ const {
   const taskRows: any[] = []
   const mockRunOpenClaw = vi.fn()
   const mockCallOpenClawGateway = vi.fn()
+  const mockSpawnAcpSession = vi.fn()
+  const mockCloseAcpSession = vi.fn()
   const mockSubmitPullRequestReview = vi.fn()
   const mockCreateIssueComment = vi.fn()
   const mockFetchPullRequest = vi.fn()
@@ -34,6 +38,8 @@ const {
   return {
     mockRunOpenClaw,
     mockCallOpenClawGateway,
+    mockSpawnAcpSession,
+    mockCloseAcpSession,
     mockSubmitPullRequestReview,
     mockCreateIssueComment,
     mockFetchPullRequest,
@@ -58,7 +64,8 @@ vi.mock('@/lib/command', () => ({
 
 vi.mock('@/lib/openclaw-gateway', () => ({
   callOpenClawGateway: mockCallOpenClawGateway,
-  spawnAcpSession: vi.fn(),
+  spawnAcpSession: mockSpawnAcpSession,
+  closeAcpSession: mockCloseAcpSession,
 }))
 
 vi.mock('@/lib/event-bus', () => ({
@@ -89,6 +96,7 @@ describe('runAegisReviews', () => {
     vi.clearAllMocks()
     mockFetchPullRequest.mockResolvedValue({ user: { login: 'review-bot' } })
     mockFetchAuthenticatedUser.mockResolvedValue({ login: 'mission-control' })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-rework', spawnId: 'spawn-1' })
   })
 
   it('approves the PR, comments on the task, and moves it to done', async () => {
@@ -122,7 +130,7 @@ describe('runAegisReviews', () => {
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = NULL') && call.args[0] === 'done')).toBe(true)
   })
 
-  it('requests changes, returns task to in_progress, and recontacts the same session', async () => {
+  it('requests changes, returns task to in_progress, and spawns a fresh developer session', async () => {
     taskRows.push({
       id: 9,
       title: 'Fix login button',
@@ -142,7 +150,7 @@ describe('runAegisReviews', () => {
       stderr: '',
       code: 0,
     })
-    mockCallOpenClawGateway.mockResolvedValue({ status: 'ok' })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-9-rework', spawnId: 'spawn-9' })
 
     const result = await runAegisReviews()
 
@@ -153,10 +161,13 @@ describe('runAegisReviews', () => {
     expect(mockSubmitPullRequestReview).toHaveBeenCalledWith('acme/app', 96, expect.objectContaining({
       body: expect.stringContaining('Reason:\nFix the hover state'),
     }))
-    expect(mockCallOpenClawGateway).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      sessionKey: 'mc-task-9',
-      message: expect.stringContaining('Do not open a new PR'),
-    }), 125000)
+    expect(mockCloseAcpSession).toHaveBeenCalledWith('mc-task-9', '/root/things/profitstack-next')
+    expect(mockSpawnAcpSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'codex',
+      cwd: '/root/things/profitstack-next',
+      label: 'mc-task-9-rework',
+      task: expect.stringContaining('Do not open a new PR'),
+    }))
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'in_progress')).toBe(true)
   })
 
@@ -208,7 +219,7 @@ describe('runAegisReviews', () => {
       stderr: '',
       code: 0,
     })
-    mockCallOpenClawGateway.mockResolvedValue({ status: 'ok' })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-12-rework', spawnId: 'spawn-12' })
     mockFetchPullRequest.mockResolvedValue({ user: { login: 'coutinhomarco' } })
     mockFetchAuthenticatedUser.mockResolvedValue({ login: 'coutinhomarco' })
 
@@ -221,9 +232,11 @@ describe('runAegisReviews', () => {
       108,
       expect.stringContaining('Reason:\nFix the failing test'),
     )
-    expect(mockCallOpenClawGateway).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      sessionKey: 'mc-task-12',
-    }), 125000)
+    expect(mockCloseAcpSession).toHaveBeenCalledWith('mc-task-12', '/root/things/profitstack-next')
+    expect(mockSpawnAcpSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'codex',
+      label: 'mc-task-12-rework',
+    }))
   })
 
   it('keeps rejected tasks in_progress even after many Aegis retries', async () => {
@@ -246,7 +259,7 @@ describe('runAegisReviews', () => {
       stderr: '',
       code: 0,
     })
-    mockCallOpenClawGateway.mockResolvedValue({ status: 'ok' })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-13-rework', spawnId: 'spawn-13' })
 
     const result = await runAegisReviews()
 
@@ -261,5 +274,41 @@ describe('runAegisReviews', () => {
     expect(mockSubmitPullRequestReview).toHaveBeenCalledWith('acme/app', 109, expect.objectContaining({
       body: expect.stringContaining('Missing persistence for fnsku\nNeed coverage for the new parser'),
     }))
+  })
+
+  it('spawns a new developer session when a rejected task has no reusable session', async () => {
+    taskRows.push({
+      id: 16,
+      title: 'Retry from fresh session',
+      description: 'Needs rework',
+      resolution: 'Done',
+      assigned_to: 'claude',
+      agent_config: JSON.stringify({ openclawId: 'claude-code-dev' }),
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({ pr_url: 'https://github.com/acme/app/pull/110', pr_file: '/tmp/mc-task-16.pr' }),
+      github_repo: 'acme/app',
+      dispatch_attempts: 2,
+    })
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'VERDICT: REJECTED\nNOTES: Fix the parser edge case',
+      stderr: '',
+      code: 0,
+    })
+    mockSpawnAcpSession.mockResolvedValue({ sessionId: 'mc-task-16-rework', spawnId: 'spawn-16' })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(true)
+    expect(mockCloseAcpSession).not.toHaveBeenCalled()
+    expect(mockSpawnAcpSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'claude-code-dev',
+      cwd: '/root/things/profitstack-next',
+      label: 'mc-task-16-rework',
+      taskId: 16,
+      task: expect.stringContaining('Fix the parser edge case'),
+    }))
+    expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'in_progress')).toBe(true)
   })
 })

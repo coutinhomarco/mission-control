@@ -12,6 +12,7 @@ import { syncSkillsFromDisk } from './skill-sync'
 import { syncLocalAgents } from './local-agent-sync'
 import { dispatchAssignedTasks, runAegisReviews, requeueStaleTasks, autoRouteInboxTasks } from './task-dispatch'
 import { spawnRecurringTasks } from './recurring-tasks'
+import { closeAcpSession } from './openclaw-gateway'
 
 const ACPX_SESSIONS_DIR = '/root/.acpx/sessions'
 
@@ -119,9 +120,18 @@ async function checkPrFiles() {
 
           // PR detected — move to review
           const updatedMeta = { ...meta, pr_url: prUrl }
+          delete updatedMeta.target_session
           db.prepare('UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ?')
             .run('review', 'success', resolution, JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
           updated.push(`task-${row.id} → review (${prUrl})`)
+          try {
+            const sessionId = String(meta?.dispatch_session_id || '').trim()
+            if (sessionId) {
+              await closeAcpSession(sessionId, String(meta?.workspace || meta?.cwd || '/root/things/profitstack-next'))
+            }
+          } catch (err) {
+            logger.warn({ taskId: row.id, err }, 'Failed to close ACP session after moving task to review')
+          }
           // Remove PR file after processing
           try { unlinkSync(prFile) } catch {}
         }

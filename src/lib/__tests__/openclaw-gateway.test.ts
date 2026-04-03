@@ -9,7 +9,7 @@ vi.mock('@/lib/command', () => ({
   runCommand,
 }))
 
-import { parseGatewayJsonOutput, spawnAcpSession } from '@/lib/openclaw-gateway'
+import { closeAcpSession, parseGatewayJsonOutput, spawnAcpSession } from '@/lib/openclaw-gateway'
 
 describe('parseGatewayJsonOutput', () => {
   beforeEach(() => {
@@ -74,6 +74,18 @@ describe('parseGatewayJsonOutput', () => {
         expect.stringContaining('IMPORTANT: When you have created the Pull Request'),
       ],
       expect.objectContaining({ allowExitCodes: [4], cwd: '/tmp/workspace', timeoutMs: 30000 })
+    )
+  })
+
+  it('closes a named ACP session through acpx', async () => {
+    runCommand.mockResolvedValueOnce({ stdout: '', stderr: '', code: 0 })
+
+    await closeAcpSession('mc-task-42', '/tmp/workspace')
+
+    expect(runCommand).toHaveBeenCalledWith(
+      expect.any(String),
+      ['sessions', 'close', 'mc-task-42'],
+      expect.objectContaining({ cwd: '/tmp/workspace', timeoutMs: 15000 }),
     )
   })
 })

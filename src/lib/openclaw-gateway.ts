@@ -155,6 +155,20 @@ export async function spawnAcpSession(params: {
   return { sessionId: sessionName, spawnId }
 }
 
+export async function closeAcpSession(sessionId: string, cwd?: string): Promise<void> {
+  const session = String(sessionId || '').trim()
+  if (!session) return
+
+  await runCommand(ACPX_BIN, [
+    'sessions',
+    'close',
+    session,
+  ], {
+    cwd: cwd || process.cwd(),
+    timeoutMs: 15_000,
+  })
+}
+
 /**
  * Poll an ACP session's history until the agent completes or a timeout is reached.
  * Returns the final result text from the session.
