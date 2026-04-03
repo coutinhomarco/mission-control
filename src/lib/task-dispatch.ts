@@ -4,6 +4,7 @@ import { callOpenClawGateway, spawnAcpSession } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
+import { submitPullRequestReview } from './github'
 
 interface DispatchableTask {
   id: number
@@ -402,6 +403,18 @@ interface ReviewableTask {
   workspace_id: number
   ticket_prefix: string | null
   project_ticket_no: number | null
+  metadata: string | null
+  github_repo: string | null
+  dispatch_attempts: number
+}
+
+interface TaskMetadata {
+  dispatch_session_id?: string
+  target_session?: string
+  pr_url?: string
+  pr_file?: string
+  workspace?: string
+  cwd?: string
 }
 
 function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
@@ -440,6 +453,11 @@ function buildReviewPrompt(task: ReviewableTask): string {
     lines.push('', '## Agent Resolution', task.resolution.substring(0, 6000))
   }
 
+  const metadata = parseTaskMetadata(task.metadata)
+  if (metadata.pr_url) {
+    lines.push('', '## Pull Request', metadata.pr_url)
+  }
+
   lines.push(
     '',
     '## Instructions',
@@ -466,6 +484,79 @@ function parseReviewVerdict(text: string): { status: 'approved' | 'rejected'; no
   return { status, notes }
 }
 
+function parseTaskMetadata(metadata: string | null | undefined): TaskMetadata {
+  if (!metadata) return {}
+  try {
+    const parsed = JSON.parse(metadata)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+export function parsePullRequestReference(prUrl: string): { repo: string; pullNumber: number } | null {
+  const match = String(prUrl || '').trim().match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/.*)?$/i)
+  if (!match) return null
+  return { repo: match[1], pullNumber: Number(match[2]) }
+}
+
+export function buildAegisReviewComment(
+  status: 'approved' | 'rejected',
+  notes: string,
+  prUrl: string,
+): string {
+  const verdict = status === 'approved' ? 'APPROVED' : 'REQUEST_CHANGES'
+  return [
+    `Aegis Review: ${verdict}`,
+    `PR: ${prUrl}`,
+    '',
+    notes.trim(),
+  ].join('\n')
+}
+
+export function buildReworkPrompt(task: ReviewableTask, notes: string, prUrl: string): string {
+  const ticket = task.ticket_prefix && task.project_ticket_no
+    ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
+    : `TASK-${task.id}`
+
+  return [
+    `Mission Control review requested changes for [${ticket}] ${task.title}.`,
+    '',
+    `PR to update: ${prUrl}`,
+    '',
+    'Review feedback:',
+    notes.trim(),
+    '',
+    'Update the existing branch and the existing PR. Do not open a new PR.',
+    'Apply the requested changes, commit them, push to the same branch, and when the PR is ready for another review write the same PR URL back to the task PR file.',
+    `Write the PR URL to: /tmp/mc-task-${task.id}.pr`,
+  ].join('\n')
+}
+
+function getReusableTaskSession(metadata: TaskMetadata): string | null {
+  const targetSession = String(metadata.target_session || '').trim()
+  if (targetSession) return targetSession
+  const dispatchSession = String(metadata.dispatch_session_id || '').trim()
+  return dispatchSession || null
+}
+
+async function sendTaskPromptToSession(taskId: number, sessionKey: string, message: string): Promise<void> {
+  const sendResult = await callOpenClawGateway<any>(
+    'chat.send',
+    {
+      sessionKey,
+      message,
+      idempotencyKey: `task-rework-${taskId}-${Date.now()}`,
+      deliver: false,
+    },
+    125_000,
+  )
+  const status = String(sendResult?.status || '').toLowerCase()
+  if (status !== 'started' && status !== 'ok' && status !== 'in_flight') {
+    throw new Error(`chat.send to session ${sessionKey} returned status: ${status}`)
+  }
+}
+
 /**
  * Run Aegis quality reviews on tasks in 'review' status.
  * Uses an agent to evaluate the task resolution, then approves or rejects.
@@ -475,7 +566,8 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 
   const tasks = db.prepare(`
     SELECT t.id, t.title, t.description, t.resolution, t.assigned_to, t.workspace_id,
-           p.ticket_prefix, t.project_ticket_no, a.config as agent_config
+           t.metadata, t.dispatch_attempts,
+           p.ticket_prefix, t.project_ticket_no, p.github_repo, a.config as agent_config
     FROM tasks t
     LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
     LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
@@ -503,6 +595,19 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 
     try {
       const prompt = buildReviewPrompt(task)
+      const metadata = parseTaskMetadata(task.metadata)
+      const prUrl = String(metadata.pr_url || '').trim()
+      if (!prUrl) {
+        throw new Error(`Task ${task.id} is awaiting review but has no pr_url in metadata`)
+      }
+      const parsedPr = parsePullRequestReference(prUrl)
+      if (!parsedPr) {
+        throw new Error(`Task ${task.id} has an invalid PR URL: ${prUrl}`)
+      }
+      const repo = String(task.github_repo || parsedPr.repo).trim()
+      if (!repo) {
+        throw new Error(`Task ${task.id} is awaiting review but no GitHub repo is configured`)
+      }
       let agentResponse: AgentResponseParsed
 
       if (!isGatewayAvailable() && getAnthropicApiKey()) {
@@ -541,6 +646,11 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       }
 
       const verdict = parseReviewVerdict(agentResponse.text)
+      const reviewComment = buildAegisReviewComment(verdict.status, verdict.notes, prUrl)
+      await submitPullRequestReview(repo, parsedPr.pullNumber, {
+        body: reviewComment,
+        event: verdict.status === 'approved' ? 'APPROVE' : 'REQUEST_CHANGES',
+      })
 
       // Insert quality review record
       db.prepare(`
@@ -548,8 +658,13 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
         VALUES (?, 'aegis', ?, ?, ?)
       `).run(task.id, verdict.status, verdict.notes, task.workspace_id)
 
+      db.prepare(`
+        INSERT INTO comments (task_id, author, content, created_at, workspace_id)
+        VALUES (?, 'aegis', ?, ?, ?)
+      `).run(task.id, reviewComment, Math.floor(Date.now() / 1000), task.workspace_id)
+
       if (verdict.status === 'approved') {
-        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
+        db.prepare('UPDATE tasks SET status = ?, error_message = NULL, updated_at = ? WHERE id = ?')
           .run('done', Math.floor(Date.now() / 1000), task.id)
 
         eventBus.broadcast('task.status_changed', {
@@ -560,8 +675,7 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       } else {
         // Rejected: check dispatch_attempts to decide next status
         const now = Math.floor(Date.now() / 1000)
-        const currentAttempts = (db.prepare('SELECT dispatch_attempts FROM tasks WHERE id = ?').get(task.id) as { dispatch_attempts: number } | undefined)?.dispatch_attempts ?? 0
-        const newAttempts = currentAttempts + 1
+        const newAttempts = (task.dispatch_attempts ?? 0) + 1
         const maxAegisRetries = 3
 
         if (newAttempts >= maxAegisRetries) {
@@ -577,24 +691,31 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
             reason: 'max_aegis_retries_exceeded',
           })
         } else {
-          // Requeue to assigned for re-dispatch with feedback
-          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ?')
-            .run('assigned', `Aegis rejected: ${verdict.notes}`, newAttempts, now, task.id)
+          const targetSession = getReusableTaskSession(metadata)
+          if (!targetSession) {
+            throw new Error(`Task ${task.id} was rejected but has no reusable developer session`)
+          }
+          const updatedMeta = {
+            ...metadata,
+            target_session: targetSession,
+            dispatch_session_id: targetSession,
+            pr_url: prUrl,
+            pr_file: metadata.pr_file || `/tmp/mc-task-${task.id}.pr`,
+          }
+          const reworkPrompt = buildReworkPrompt(task, verdict.notes, prUrl)
+          await sendTaskPromptToSession(task.id, targetSession, reworkPrompt)
+
+          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?')
+            .run('in_progress', `Aegis requested changes: ${verdict.notes}`, newAttempts, JSON.stringify(updatedMeta), now, task.id)
 
           eventBus.broadcast('task.status_changed', {
             id: task.id,
-            status: 'assigned',
+            status: 'in_progress',
             previous_status: 'quality_review',
-            error_message: `Aegis rejected: ${verdict.notes}`,
+            error_message: `Aegis requested changes: ${verdict.notes}`,
             reason: 'aegis_rejection',
           })
         }
-
-        // Add rejection as a comment so the agent sees it on next dispatch
-        db.prepare(`
-          INSERT INTO comments (task_id, author, content, created_at, workspace_id)
-          VALUES (?, 'aegis', ?, ?, ?)
-        `).run(task.id, `Quality Review Rejected (attempt ${newAttempts}/${maxAegisRetries}):\n${verdict.notes}`, now, task.workspace_id)
       }
 
       db_helpers.logActivity(
@@ -773,10 +894,10 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       // Check for previous Aegis rejection feedback
       const rejectionRow = db.prepare(`
         SELECT content FROM comments
-        WHERE task_id = ? AND author = 'aegis' AND content LIKE 'Quality Review Rejected:%'
+        WHERE task_id = ? AND author = 'aegis' AND content LIKE 'Aegis Review: REQUEST_CHANGES%'
         ORDER BY created_at DESC LIMIT 1
       `).get(task.id) as { content: string } | undefined
-      const rejectionFeedback = rejectionRow?.content?.replace(/^Quality Review Rejected:\n?/, '') || null
+      const rejectionFeedback = rejectionRow?.content?.replace(/^Aegis Review: REQUEST_CHANGES\s+PR:\s+\S+\s*/i, '').trim() || null
 
       const prompt = buildTaskPrompt(task, rejectionFeedback)
 
@@ -824,7 +945,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         finalizeImmediately = false
         agentResponse = {
           text: `Task dispatched to existing session ${targetSession}. The agent will process it within that session context.`,
-          sessionId: sendResult?.runId || targetSession,
+          sessionId: targetSession,
         }
       } else {
         // Spawn via acpx spawn --no-wait (non-blocking).
@@ -906,6 +1027,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         existingMeta.dispatch_session_id = agentResponse.sessionId
       }
       if (!finalizeImmediately) {
+        if (agentResponse.sessionId) {
+          existingMeta.target_session = agentResponse.sessionId
+        }
         existingMeta.pr_file = prFile
         existingMeta.workspace = workspace
       } else {

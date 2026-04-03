@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildTaskPrompt, getTaskBaseBranch, shouldAwaitPrBeforeReview } from '@/lib/task-dispatch'
+import {
+  buildAegisReviewComment,
+  buildReworkPrompt,
+  buildTaskPrompt,
+  getTaskBaseBranch,
+  parsePullRequestReference,
+  shouldAwaitPrBeforeReview,
+} from '@/lib/task-dispatch'
 
 describe('shouldAwaitPrBeforeReview', () => {
   it('returns true when async dispatch metadata includes a pr_file', () => {
@@ -69,5 +76,44 @@ describe('buildTaskPrompt', () => {
     expect(prompt).toContain('git checkout staging')
     expect(prompt).toContain('git pull --ff-only origin staging')
     expect(prompt).toContain('gh pr create --base staging')
+  })
+})
+
+describe('parsePullRequestReference', () => {
+  it('extracts repo and PR number from a GitHub PR URL', () => {
+    expect(parsePullRequestReference('https://github.com/acme/app/pull/96')).toEqual({
+      repo: 'acme/app',
+      pullNumber: 96,
+    })
+  })
+
+  it('returns null for non-PR URLs', () => {
+    expect(parsePullRequestReference('https://github.com/acme/app/issues/96')).toBeNull()
+  })
+})
+
+describe('review follow-up prompts', () => {
+  it('formats an Aegis review comment as an operational review record', () => {
+    expect(buildAegisReviewComment('approved', 'Looks good', 'https://github.com/acme/app/pull/96')).toContain('Aegis Review: APPROVED')
+  })
+
+  it('tells the developer to update the same PR on rework', () => {
+    const prompt = buildReworkPrompt({
+      id: 9,
+      title: 'Fix login button',
+      description: null,
+      resolution: null,
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: null,
+      github_repo: 'acme/app',
+      dispatch_attempts: 1,
+    }, 'Change the color token', 'https://github.com/acme/app/pull/96')
+
+    expect(prompt).toContain('Do not open a new PR')
+    expect(prompt).toContain('/tmp/mc-task-9.pr')
   })
 })

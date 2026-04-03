@@ -300,6 +300,8 @@ export interface GitHubPullRequest {
   updated_at: string
 }
 
+export type GitHubPullRequestReviewEvent = 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT'
+
 /**
  * Fetch pull requests from a GitHub repo.
  */
@@ -346,4 +348,25 @@ export async function createPullRequest(
     throw new Error(`GitHub API error ${res.status}: ${text}`)
   }
   return res.json()
+}
+
+/**
+ * Submit a formal pull request review.
+ */
+export async function submitPullRequestReview(
+  repo: string,
+  pullNumber: number,
+  review: {
+    body: string
+    event: GitHubPullRequestReviewEvent
+  }
+): Promise<void> {
+  const res = await githubFetch(`/repos/${repo}/pulls/${pullNumber}/reviews`, {
+    method: 'POST',
+    body: JSON.stringify(review),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`GitHub API error ${res.status}: ${text}`)
+  }
 }
