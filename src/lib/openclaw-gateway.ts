@@ -67,11 +67,17 @@ export async function callOpenClawGateway<T = unknown>(
 
 const ACPX_BIN = '/root/.nvm/versions/node/v22.22.2/lib/node_modules/openclaw/node_modules/.bin/acpx'
 
+function normalizeAcpAgent(agentId?: string): string {
+  const normalized = String(agentId || '').trim()
+  return normalized || 'codex'
+}
+
 /**
  * Spawn an ACP session via acpx CLI.
  *
- * Flow: acpx codex sessions new --name <sessionName>  (creates named session)
- *        acpx codex --no-wait --session <sessionName> "<prompt>"  (queues prompt, non-blocking)
+ * Flow: acpx --approve-all <agent> sessions new --name <sessionName>  (creates named session)
+ *        acpx --approve-all <agent> set-mode -s <sessionName> auto     (enable read/write execution without prompts)
+ *        acpx [--model <id>] --approve-all <agent> --no-wait --session <sessionName> "<prompt>"  (queues prompt, non-blocking)
  *
  * The agent process starts automatically when the session is created.
  * We queue the work immediately after so the agent picks it up.
@@ -90,7 +96,7 @@ export async function spawnAcpSession(params: {
   const spawnId = `spawn-${Date.now()}-${randomUUID().slice(0, 8)}`
   const sessionName = params.label || `mc-task-${params.taskId || 'unknown'}`
   const cwd = params.cwd || process.cwd()
-  const agent = params.agentId || 'codex'
+  const agent = normalizeAcpAgent(params.agentId)
 
   // Build the prompt — include instruction to write PR URL to file
   const prFile = `/tmp/mc-task-${params.taskId}.pr`
@@ -107,37 +113,44 @@ export async function spawnAcpSession(params: {
   }
 
   // Step 1: Create a named session.
-  // acpx codex sessions new --name <sessionName>
-  const createResult = await runCommand(ACPX_BIN, [
-    'codex', 'sessions', 'new', '--name', sessionName,
+  // acpx --approve-all <agent> sessions new --name <sessionName>
+  await runCommand(ACPX_BIN, [
+    '--approve-all',
+    agent, 'sessions', 'new', '--name', sessionName,
   ], {
     cwd,
     timeoutMs: 30_000,
   })
 
-  if (createResult.code !== 0) {
-    throw new Error(`acpx codex sessions new failed: ${createResult.stderr || createResult.stdout}`)
-  }
+  // Step 2: Put the session in normal auto mode instead of the ACP default
+  // read-only preset; otherwise async Mission Control jobs abort on the first
+  // write/exec permission prompt.
+  await runCommand(ACPX_BIN, [
+    '--approve-all',
+    agent,
+    'set-mode',
+    '--session',
+    sessionName,
+    'auto',
+  ], {
+    cwd,
+    timeoutMs: 30_000,
+  })
 
-  // Step 2: Queue the prompt to the newly created session (non-blocking).
-  // acpx codex --no-wait --session <sessionName> "<prompt>"
-  const queueResult = await runCommand(ACPX_BIN, [
-    'codex',
+  // Step 3: Queue the prompt to the newly created session (non-blocking).
+  // acpx [--model <id>] --approve-all <agent> --no-wait --session <sessionName> "<prompt>"
+  await runCommand(ACPX_BIN, [
+    '--approve-all',
+    ...(params.model ? ['--model', params.model] : []),
+    agent,
     '--no-wait',
     '--session', sessionName,
     fullTask,
   ], {
+    allowExitCodes: [4],
     cwd,
     timeoutMs: 30_000,
   })
-
-  // acpx queues the prompt asynchronously. Exit code 4 = queued successfully.
-  // Exit code 0 = agent was idle and picked it up immediately.
-  // Any other code is a real error.
-  const okCodes = [0, 4]
-  if (!okCodes.includes(queueResult.code ?? -1)) {
-    throw new Error(`acpx codex --no-wait failed: ${queueResult.stderr || queueResult.stdout}`)
-  }
 
   return { sessionId: sessionName, spawnId }
 }

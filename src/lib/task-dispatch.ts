@@ -1,6 +1,6 @@
 import { getDatabase, db_helpers } from './db'
-import { runOpenClaw } from './command'
-import { callOpenClawGateway, spawnAcpSession, pollAcpSessionUntilComplete } from './openclaw-gateway'
+import { runCommand, runOpenClaw } from './command'
+import { callOpenClawGateway, spawnAcpSession } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
 import { config } from './config'
@@ -19,6 +19,7 @@ interface DispatchableTask {
   ticket_prefix: string | null
   project_ticket_no: number | null
   project_id: number | null
+  github_default_branch?: string | null
   tags?: string[]
 }
 
@@ -89,10 +90,87 @@ function resolveGatewayAgentId(task: DispatchableTask): string {
   return task.agent_name
 }
 
-function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
+export function shouldAwaitPrBeforeReview(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return false
+  const prFile = (metadata as Record<string, unknown>).pr_file
+  return typeof prFile === 'string' && prFile.trim().length > 0
+}
+
+export function getTaskBaseBranch(task: Pick<DispatchableTask, 'github_default_branch'>): string {
+  const branch = String(task.github_default_branch || '').trim()
+  return branch || 'dev'
+}
+
+async function validatePrWorkflowPrereqs(workspace: string): Promise<string | null> {
+  try {
+    await runCommand('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: workspace,
+      timeoutMs: 10_000,
+    })
+  } catch {
+    return `Workspace ${workspace} is not a git repository`
+  }
+
+  try {
+    await runCommand('git', ['remote', 'get-url', 'origin'], {
+      cwd: workspace,
+      timeoutMs: 10_000,
+    })
+  } catch {
+    return `Workspace ${workspace} has no origin remote configured`
+  }
+
+  try {
+    await runCommand('gh', ['auth', 'status'], {
+      cwd: workspace,
+      timeoutMs: 15_000,
+    })
+  } catch (err: any) {
+    return `GitHub CLI auth check failed: ${err.message || 'gh auth status failed'}`
+  }
+
+  return null
+}
+
+async function prepareWorkspaceForTask(workspace: string, baseBranch: string): Promise<void> {
+  const status = await runCommand('git', ['status', '--porcelain'], {
+    cwd: workspace,
+    timeoutMs: 10_000,
+  })
+  if (status.stdout.trim()) {
+    throw new Error(
+      `Workspace ${workspace} has uncommitted changes; cannot reset to ${baseBranch} before creating the task branch`
+    )
+  }
+
+  await runCommand('git', ['fetch', 'origin', baseBranch], {
+    cwd: workspace,
+    timeoutMs: 30_000,
+  })
+
+  try {
+    await runCommand('git', ['checkout', baseBranch], {
+      cwd: workspace,
+      timeoutMs: 15_000,
+    })
+  } catch {
+    await runCommand('git', ['checkout', '-b', baseBranch, '--track', `origin/${baseBranch}`], {
+      cwd: workspace,
+      timeoutMs: 15_000,
+    })
+  }
+
+  await runCommand('git', ['pull', '--ff-only', 'origin', baseBranch], {
+    cwd: workspace,
+    timeoutMs: 30_000,
+  })
+}
+
+export function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
   const ticket = task.ticket_prefix && task.project_ticket_no
     ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
     : `TASK-${task.id}`
+  const baseBranch = getTaskBaseBranch(task)
 
   const lines = [
     'You have been assigned a task in Mission Control.',
@@ -116,14 +194,16 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
   lines.push('',
     '## IMPORTANT: Pull Request Required',
     'You MUST create a Pull Request for this task. Follow these steps:',
-    `1. Create a branch: git checkout -b task-${task.id}/description`,
-    '2. Make your changes',
-    `3. Commit: git commit -m "[TASK-${task.id}] description"`,
-    `4. Push: git push -u origin task-${task.id}/description`,
-    `5. Create PR: gh pr create --title "[TASK-${task.id}] ${task.title}" --body "Task: TASK-${task.id}"`,
-    `6. Write the PR URL to: /tmp/mc-task-${task.id}.pr`,
+    `1. Return to the base branch: git checkout ${baseBranch}`,
+    `2. Update it: git pull --ff-only origin ${baseBranch}`,
+    `3. Create your task branch from ${baseBranch}: git checkout -b task-${task.id}/description`,
+    '4. Make your changes',
+    `5. Commit: git commit -m "[TASK-${task.id}] description"`,
+    `6. Push: git push -u origin task-${task.id}/description`,
+    `7. Create PR: gh pr create --base ${baseBranch} --title "[TASK-${task.id}] ${task.title}" --body "Task: TASK-${task.id}"`,
+    `8. Write the PR URL to: /tmp/mc-task-${task.id}.pr`,
     '',
-    'The PR must be created before marking the task as complete. Mission Control will detect the PR and move the task to review.')
+    `The PR must be created before marking the task as complete. Always branch from the latest ${baseBranch}. Mission Control will detect the PR and move the task to review.`)
   return lines.join('\n')
 }
 
@@ -642,7 +722,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
   const tasks = db.prepare(`
     SELECT t.*, a.name as agent_name, a.id as agent_id, a.config as agent_config,
-           p.ticket_prefix, t.project_ticket_no
+           p.ticket_prefix, t.project_ticket_no, p.github_default_branch
     FROM tasks t
     JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
@@ -710,8 +790,14 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       const targetSession: string | null = typeof taskMeta?.target_session === 'string' && taskMeta.target_session
         ? taskMeta.target_session
         : null
+      const dispatchModel = classifyTaskModel(task)
+      const resolvedAgentId = resolveGatewayAgentId(task)
+      const prFile = `/tmp/mc-task-${task.id}.pr`
+      const workspace = taskMeta?.workspace || taskMeta?.cwd || '/root/things/profitstack-next'
+      const baseBranch = getTaskBaseBranch(task)
 
       let agentResponse: AgentResponseParsed
+      let finalizeImmediately = true
       const useDirectApi = !isGatewayAvailable() && getAnthropicApiKey()
 
       if (useDirectApi && !targetSession) {
@@ -735,6 +821,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           throw new Error(`chat.send to session ${targetSession} returned status: ${status}`)
         }
         // chat.send is fire-and-forget; we record the session but won't get inline response text
+        finalizeImmediately = false
         agentResponse = {
           text: `Task dispatched to existing session ${targetSession}. The agent will process it within that session context.`,
           sessionId: sendResult?.runId || targetSession,
@@ -743,43 +830,29 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         // Spawn via acpx spawn --no-wait (non-blocking).
         // Agent writes PR URL to /tmp/mc-task-{id}.pr when done.
         // A separate pr_check scheduler job detects PR creation and moves to review.
-        const dispatchModel = classifyTaskModel(task)
-        const prFile = `/tmp/mc-task-${task.id}.pr`
-
-        // Get workspace from task metadata or use default
-        const taskMeta = (() => {
-          try {
-            const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
-            return row?.metadata ? JSON.parse(row.metadata) : {}
-          } catch { return {} }
-        })()
-        const workspace = taskMeta?.workspace || taskMeta?.cwd || '/root/things/profitstack-next'
+        const prereqError = await validatePrWorkflowPrereqs(workspace)
+        if (prereqError) {
+          throw new Error(prereqError)
+        }
+        await prepareWorkspaceForTask(workspace, baseBranch)
 
         let acpSessionId: string | null = null
 
         try {
           const spawnResult = await spawnAcpSession({
             task: prompt,
-            agentId: 'codex',
+            agentId: resolvedAgentId,
             model: dispatchModel ?? undefined,
             label: `mc-task-${task.id}`,
             cwd: workspace,
             taskId: task.id,
           })
           acpSessionId = spawnResult.sessionId
-          logger.info({ taskId: task.id, sessionId: acpSessionId, workspace }, 'ACP session spawned via acpx, waiting for PR')
-
-          // Record spawn info in task metadata (pr_check will pick this up)
-          const updatedMeta = { ...taskMeta }
-          updatedMeta.dispatch_session_id = acpSessionId
-          updatedMeta.pr_file = prFile
-          updatedMeta.workspace = workspace
-          updatedMeta.dispatch_attempts = (updatedMeta.dispatch_attempts || 0) + 1
-          db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?')
-            .run(JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), task.id)
+          finalizeImmediately = false
+          logger.info({ taskId: task.id, sessionId: acpSessionId, workspace, agentId: resolvedAgentId }, 'ACP session spawned via acpx, waiting for PR')
 
           agentResponse = {
-            text: `[Task dispatched to Codex. Agent is working on branch task-${task.id}/... PR will be created and task moved to review when ready.]`,
+            text: `[Task dispatched to ${resolvedAgentId}. Agent is working on branch task-${task.id}/... PR will be created and task moved to review when ready.]`,
             sessionId: acpSessionId,
           }
         } catch (err: any) {
@@ -789,7 +862,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           // For now we don't have a callback listener, so use --expect-final to get result inline
           const invokeParams: Record<string, unknown> = {
             message: prompt,
-            agentId: 'codex',
+            agentId: resolvedAgentId,
             idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
             deliver: true,
           }
@@ -831,6 +904,48 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       })()
       if (agentResponse.sessionId) {
         existingMeta.dispatch_session_id = agentResponse.sessionId
+      }
+      if (!finalizeImmediately) {
+        existingMeta.pr_file = prFile
+        existingMeta.workspace = workspace
+      } else {
+        delete existingMeta.pr_file
+      }
+
+      if (!finalizeImmediately && shouldAwaitPrBeforeReview(existingMeta)) {
+        db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?')
+          .run(JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id)
+
+        db.prepare(`
+          INSERT INTO comments (task_id, author, content, created_at, workspace_id)
+          VALUES (?, 'scheduler', ?, ?, ?)
+        `).run(
+          task.id,
+          truncated,
+          Math.floor(Date.now() / 1000),
+          task.workspace_id
+        )
+
+        eventBus.broadcast('task.updated', {
+          id: task.id,
+          status: 'in_progress',
+          assigned_to: task.assigned_to,
+          dispatch_session_id: agentResponse.sessionId,
+        })
+
+        db_helpers.logActivity(
+          'task_agent_started',
+          'task',
+          task.id,
+          'scheduler',
+          `Agent accepted task "${task.title}" and is working asynchronously`,
+          { dispatch_session_id: agentResponse.sessionId, pr_file: existingMeta.pr_file, workspace: existingMeta.workspace },
+          task.workspace_id
+        )
+
+        results.push({ id: task.id, success: true })
+        logger.info({ taskId: task.id, agent: task.agent_name, sessionId: agentResponse.sessionId }, 'Task dispatched asynchronously; awaiting PR')
+        continue
       }
 
       // Update task: status → review, set outcome

@@ -13,6 +13,79 @@ import { syncLocalAgents } from './local-agent-sync'
 import { dispatchAssignedTasks, runAegisReviews, requeueStaleTasks, autoRouteInboxTasks } from './task-dispatch'
 import { spawnRecurringTasks } from './recurring-tasks'
 
+const ACPX_SESSIONS_DIR = '/root/.acpx/sessions'
+
+function parseJsonLine(line: string): any | null {
+  try {
+    return JSON.parse(line)
+  } catch {
+    return null
+  }
+}
+
+export function extractFinalAgentMessageFromAcpStream(streamText: string): string | null {
+  const lines = String(streamText || '').split('\n').filter(Boolean)
+  const completedTurns: string[] = []
+  let currentTurn = ''
+
+  for (const line of lines) {
+    const payload = parseJsonLine(line)
+    if (!payload) continue
+
+    const update = payload?.params?.update
+    if (payload?.method === 'session/update' && update?.sessionUpdate === 'agent_message_chunk') {
+      const text = update?.content?.type === 'text' ? update.content.text : ''
+      if (typeof text === 'string') currentTurn += text
+      continue
+    }
+
+    const stopReason = payload?.result?.stopReason
+    if (typeof stopReason === 'string' && currentTurn.trim()) {
+      completedTurns.push(currentTurn.trim())
+      currentTurn = ''
+    }
+  }
+
+  if (currentTurn.trim()) {
+    completedTurns.push(currentTurn.trim())
+  }
+
+  return completedTurns.at(-1) || null
+}
+
+function loadTaskResolutionFromAcpSession(sessionName: string): string | null {
+  if (!sessionName) return null
+
+  try {
+    const indexPath = join(ACPX_SESSIONS_DIR, 'index.json')
+    if (!existsSync(indexPath)) return null
+
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'))
+    const entries = Array.isArray(index?.entries) ? index.entries : []
+    const matches = entries
+      .filter((entry: any) => entry?.name === sessionName && typeof entry?.file === 'string')
+      .sort((a: any, b: any) => {
+        const aClosed = a?.closed ? 1 : 0
+        const bClosed = b?.closed ? 1 : 0
+        if (aClosed !== bClosed) return bClosed - aClosed
+        const aTime = Date.parse(String(a?.lastUsedAt || 0))
+        const bTime = Date.parse(String(b?.lastUsedAt || 0))
+        return bTime - aTime
+      })
+
+    for (const match of matches) {
+      const streamPath = join(ACPX_SESSIONS_DIR, String(match.file).replace(/\.json$/, '.stream.ndjson'))
+      if (!existsSync(streamPath)) continue
+      const resolution = extractFinalAgentMessageFromAcpStream(readFileSync(streamPath, 'utf8'))
+      if (resolution) return resolution
+    }
+  } catch (err) {
+    logger.warn({ sessionName, err }, 'Failed to load ACP session resolution')
+  }
+
+  return null
+}
+
 // PR file polling for non-blocking ACP dispatch
 async function checkPrFiles() {
   const db = getDatabase()
@@ -41,10 +114,13 @@ async function checkPrFiles() {
       if (existsSync(prFile)) {
         const prUrl = readFileSync(prFile, 'utf8').trim()
         if (prUrl && prUrl.startsWith('http')) {
+          const resolution = loadTaskResolutionFromAcpSession(String(meta?.dispatch_session_id || ''))
+            || `PR created: ${prUrl}`
+
           // PR detected — move to review
           const updatedMeta = { ...meta, pr_url: prUrl }
-          db.prepare('UPDATE tasks SET status = ?, metadata = ?, updated_at = ? WHERE id = ?')
-            .run('review', JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
+          db.prepare('UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ?')
+            .run('review', 'success', resolution, JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
           updated.push(`task-${row.id} → review (${prUrl})`)
           // Remove PR file after processing
           try { unlinkSync(prFile) } catch {}

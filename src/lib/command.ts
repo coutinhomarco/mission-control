@@ -7,6 +7,7 @@ interface CommandOptions {
   timeoutMs?: number
   input?: string
   onData?: (chunk: string) => void
+  allowExitCodes?: number[]
 }
 
 interface CommandResult {
@@ -56,7 +57,8 @@ export function runCommand(
 
     child.on('close', (code) => {
       if (timeoutId) clearTimeout(timeoutId)
-      if (code === 0) {
+      const allowedExitCodes = new Set([0, ...(options.allowExitCodes || [])])
+      if (code !== null && allowedExitCodes.has(code)) {
         resolve({ stdout, stderr, code })
         return
       }
