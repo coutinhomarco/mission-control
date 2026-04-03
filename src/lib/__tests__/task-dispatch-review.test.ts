@@ -89,6 +89,17 @@ vi.mock('@/lib/github', () => ({
 
 import { runAegisReviews } from '@/lib/task-dispatch'
 
+function extractGatewayPrompt(): string {
+  const args = mockRunOpenClaw.mock.calls.at(-1)?.[0] as string[] | undefined
+  expect(args).toBeTruthy()
+  const paramsIndex = args!.indexOf('--params')
+  expect(paramsIndex).toBeGreaterThanOrEqual(0)
+  const raw = args![paramsIndex + 1]
+  expect(typeof raw).toBe('string')
+  const parsed = JSON.parse(String(raw))
+  return String(parsed.message || '')
+}
+
 describe('runAegisReviews', () => {
   beforeEach(() => {
     taskRows.length = 0
@@ -128,6 +139,9 @@ describe('runAegisReviews', () => {
     }))
     expect(runCalls.some((call) => call.sql.includes('INSERT INTO comments') && String(call.args[1]).includes('Aegis Review: APPROVED'))).toBe(true)
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = NULL') && call.args[0] === 'done')).toBe(true)
+    expect(extractGatewayPrompt()).toContain('Use the PR URL and the local git checkout to inspect the actual code changes before deciding.')
+    expect(extractGatewayPrompt()).toContain('Repository: acme/app')
+    expect(extractGatewayPrompt()).toContain('Workspace: /root/things/profitstack-next')
   })
 
   it('requests changes, returns task to in_progress, and spawns a fresh developer session', async () => {
@@ -340,5 +354,38 @@ describe('runAegisReviews', () => {
     expect(mockCreateIssueComment).not.toHaveBeenCalled()
     expect(mockSpawnAcpSession).not.toHaveBeenCalled()
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'review')).toBe(true)
+  })
+
+  it('includes the task workspace from metadata in the Aegis prompt', async () => {
+    taskRows.push({
+      id: 18,
+      title: 'Review in custom workspace',
+      description: 'Use the checked out repo',
+      resolution: 'Implemented the change.',
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({
+        pr_url: 'https://github.com/acme/app/pull/112',
+        dispatch_session_id: 'mc-task-18',
+        workspace: '/root/things/custom-app',
+      }),
+      github_repo: 'acme/app',
+      dispatch_attempts: 0,
+    })
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'VERDICT: APPROVED\nNOTES: Verified in the diff',
+      stderr: '',
+      code: 0,
+    })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(true)
+    expect(extractGatewayPrompt()).toContain('## Pull Request\nhttps://github.com/acme/app/pull/112')
+    expect(extractGatewayPrompt()).toContain('Workspace: /root/things/custom-app')
+    expect(extractGatewayPrompt()).toContain('Use git and/or gh commands in the workspace to review the changed files, diff, and relevant implementation details.')
   })
 })

@@ -542,6 +542,10 @@ function buildReviewPrompt(task: ReviewableTask): string {
   const ticket = task.ticket_prefix && task.project_ticket_no
     ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
     : `TASK-${task.id}`
+  const metadata = parseTaskMetadata(task.metadata)
+  const prUrl = String(metadata.pr_url || '').trim()
+  const workspace = getTaskWorkspace(metadata)
+  const repo = String(task.github_repo || '').trim()
 
   const lines = [
     'You are Aegis, the quality reviewer for Mission Control.',
@@ -558,17 +562,25 @@ function buildReviewPrompt(task: ReviewableTask): string {
     lines.push('', '## Agent Resolution', task.resolution.substring(0, 6000))
   }
 
-  const metadata = parseTaskMetadata(task.metadata)
-  if (metadata.pr_url) {
-    lines.push('', '## Pull Request', metadata.pr_url)
+  if (prUrl) {
+    lines.push('', '## Pull Request', prUrl)
   }
+
+  lines.push('', '## Review Context')
+  if (repo) {
+    lines.push(`Repository: ${repo}`)
+  }
+  lines.push(`Workspace: ${workspace}`)
 
   lines.push(
     '',
     '## Instructions',
-    'Review only the task and PR information provided in this prompt.',
+    'Review only the task, PR, and repository information provided in this prompt.',
     'Do not rely on prior conversation memory, prior reviews, or assumptions that this request is spam or a duplicate.',
-    'Evaluate whether the agent\'s response adequately addresses the task.',
+    'Use the PR URL and the local git checkout to inspect the actual code changes before deciding.',
+    'Use git and/or gh commands in the workspace to review the changed files, diff, and relevant implementation details.',
+    'Evaluate the implementation itself, not just the agent\'s written resolution summary.',
+    'If you cannot verify the code changes, state the specific verification blocker in NOTES.',
     'Respond with EXACTLY one of these two formats:',
     '',
     'If the work is acceptable:',
