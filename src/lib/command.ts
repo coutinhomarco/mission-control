@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import path from 'node:path'
 import { config } from './config'
 
 interface CommandOptions {
@@ -22,9 +23,17 @@ export function runCommand(
   options: CommandOptions = {}
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
+    const nodeBinDir = path.dirname(process.execPath)
+    const baseEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: [nodeBinDir, process.env.PATH || ''].filter(Boolean).join(':'),
+    }
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: options.env,
+      env: {
+        ...baseEnv,
+        ...options.env,
+      },
       shell: false
     })
 
@@ -83,11 +92,15 @@ export function runOpenClaw(args: string[], options: CommandOptions = {}) {
   // Without this, the CLI may interpret OPENCLAW_HOME as a parent directory and
   // append ".openclaw" to it — causing double-nesting when OPENCLAW_HOME is
   // already set to the state directory (e.g. /root/.openclaw → /root/.openclaw/.openclaw).
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
+  // NOTE: do NOT spread process.env here — runCommand already does that while
+  // augmenting PATH with the node binary directory. Spreading process.env again
+  // in options.env would overwrite that augmented PATH with the original (nvm-less)
+  // systemd PATH, causing "node: No such file or directory" errors when openclaw's
+  // #!/usr/bin/env node shebang is resolved.
+  const env = {
     OPENCLAW_STATE_DIR: config.openclawStateDir,
     ...options.env,
-  }
+  } as NodeJS.ProcessEnv
   return runCommand(config.openclawBin, args, {
     ...options,
     env,

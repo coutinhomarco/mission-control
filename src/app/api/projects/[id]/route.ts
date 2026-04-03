@@ -167,7 +167,7 @@ export async function PATCH(
     }
     if (body?.github_default_branch !== undefined) {
       updates.push('github_default_branch = ?')
-      paramsList.push(typeof body.github_default_branch === 'string' ? body.github_default_branch.trim() || 'main' : 'main')
+      paramsList.push(typeof body.github_default_branch === 'string' ? body.github_default_branch.trim() || 'dev' : 'dev')
     }
     if (body?.github_labels_initialized !== undefined) {
       updates.push('github_labels_initialized = ?')

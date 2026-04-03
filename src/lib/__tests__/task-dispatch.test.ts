@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildAegisReviewComment,
+  hasBlockingWorkspaceChanges,
   buildReworkPrompt,
   buildTaskPrompt,
   getTaskBaseBranch,
@@ -25,8 +26,25 @@ describe('getTaskBaseBranch', () => {
     expect(getTaskBaseBranch({ github_default_branch: null })).toBe('dev')
   })
 
+  it('treats legacy main configuration as dev', () => {
+    expect(getTaskBaseBranch({ github_default_branch: 'main' })).toBe('dev')
+  })
+
   it('uses the configured project base branch when present', () => {
     expect(getTaskBaseBranch({ github_default_branch: 'release' })).toBe('release')
+  })
+})
+
+describe('hasBlockingWorkspaceChanges', () => {
+  it('ignores untracked .openclaw artifacts', () => {
+    expect(hasBlockingWorkspaceChanges('?? .openclaw/\n')).toBe(false)
+    expect(hasBlockingWorkspaceChanges('?? .openclaw/session/log.json\n')).toBe(false)
+  })
+
+  it('still blocks on real repository changes', () => {
+    expect(hasBlockingWorkspaceChanges(' M src/app.ts\n')).toBe(true)
+    expect(hasBlockingWorkspaceChanges('?? src/new-file.ts\n')).toBe(true)
+    expect(hasBlockingWorkspaceChanges('?? .openclaw/\n M src/app.ts\n')).toBe(true)
   })
 })
 
@@ -50,7 +68,7 @@ describe('buildTaskPrompt', () => {
     })
 
     expect(prompt).toContain('git checkout dev')
-    expect(prompt).toContain('git pull --ff-only origin dev')
+    expect(prompt).toContain('git fetch origin dev && git reset --hard origin/dev')
     expect(prompt).toContain('Create your task branch from dev')
     expect(prompt).toContain('gh pr create --base dev')
   })
@@ -74,7 +92,7 @@ describe('buildTaskPrompt', () => {
     })
 
     expect(prompt).toContain('git checkout staging')
-    expect(prompt).toContain('git pull --ff-only origin staging')
+    expect(prompt).toContain('git fetch origin staging && git reset --hard origin/staging')
     expect(prompt).toContain('gh pr create --base staging')
   })
 })

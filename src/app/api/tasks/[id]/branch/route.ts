@@ -6,6 +6,12 @@ import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { createRef, getRef, fetchPullRequests, createPullRequest } from '@/lib/github'
 
+function getProjectBaseBranch(branch: unknown): string {
+  const normalized = typeof branch === 'string' ? branch.trim() : ''
+  if (!normalized || normalized === 'main') return 'dev'
+  return normalized
+}
+
 function slugify(title: string, maxLen: number): string {
   return title
     .toLowerCase()
@@ -124,7 +130,7 @@ export async function POST(
     }
 
     const repo = task.github_repo as string
-    const defaultBranch = (task.github_default_branch as string) || 'main'
+    const defaultBranch = getProjectBaseBranch(task.github_default_branch)
 
     let body: Record<string, unknown> = {}
     try {

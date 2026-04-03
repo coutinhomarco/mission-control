@@ -1410,6 +1410,21 @@ const migrations: Migration[] = [
         )
       `)
     }
+  },
+  {
+    id: '049_projects_default_branch_dev',
+    up(db: Database.Database) {
+      const cols = db.prepare(`PRAGMA table_info(projects)`).all() as Array<{ name: string }>
+      if (!cols.some((c) => c.name === 'github_default_branch')) return
+
+      db.exec(`
+        UPDATE projects
+        SET github_default_branch = 'dev'
+        WHERE github_default_branch IS NULL
+           OR trim(github_default_branch) = ''
+           OR lower(trim(github_default_branch)) = 'main'
+      `)
+    }
   }
 ]
 

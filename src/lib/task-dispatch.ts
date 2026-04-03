@@ -99,7 +99,30 @@ export function shouldAwaitPrBeforeReview(metadata: unknown): boolean {
 
 export function getTaskBaseBranch(task: Pick<DispatchableTask, 'github_default_branch'>): string {
   const branch = String(task.github_default_branch || '').trim()
-  return branch || 'dev'
+  if (!branch || branch === 'main') return 'dev'
+  return branch
+}
+
+function parsePorcelainPath(line: string): string {
+  const trimmed = line.trimEnd()
+  if (trimmed.length <= 3) return ''
+  const payload = trimmed.slice(3)
+  const renamed = payload.includes(' -> ') ? payload.split(' -> ').at(-1) || payload : payload
+  return renamed.trim()
+}
+
+export function hasBlockingWorkspaceChanges(statusOutput: string): boolean {
+  const lines = statusOutput
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+
+  return lines.some((line) => {
+    const path = parsePorcelainPath(line)
+    if (!path) return true
+    if (path === '.openclaw' || path.startsWith('.openclaw/')) return false
+    return true
+  })
 }
 
 async function validatePrWorkflowPrereqs(workspace: string): Promise<string | null> {
@@ -138,7 +161,7 @@ async function prepareWorkspaceForTask(workspace: string, baseBranch: string): P
     cwd: workspace,
     timeoutMs: 10_000,
   })
-  if (status.stdout.trim()) {
+  if (hasBlockingWorkspaceChanges(status.stdout)) {
     throw new Error(
       `Workspace ${workspace} has uncommitted changes; cannot reset to ${baseBranch} before creating the task branch`
     )
@@ -196,7 +219,7 @@ export function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: stri
     '## IMPORTANT: Pull Request Required',
     'You MUST create a Pull Request for this task. Follow these steps:',
     `1. Return to the base branch: git checkout ${baseBranch}`,
-    `2. Update it: git pull --ff-only origin ${baseBranch}`,
+    `2. Update it: git fetch origin ${baseBranch} && git reset --hard origin/${baseBranch}`,
     `3. Create your task branch from ${baseBranch}: git checkout -b task-${task.id}/description`,
     '4. Make your changes',
     `5. Commit: git commit -m "[TASK-${task.id}] description"`,
