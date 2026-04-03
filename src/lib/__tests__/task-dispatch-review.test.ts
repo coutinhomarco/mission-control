@@ -311,4 +311,34 @@ describe('runAegisReviews', () => {
     }))
     expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, metadata = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'in_progress')).toBe(true)
   })
+
+  it('treats generic rejection notes as an invalid review and keeps the task in review', async () => {
+    taskRows.push({
+      id: 17,
+      title: 'Reject with details',
+      description: 'Needs actionable feedback',
+      resolution: 'Done',
+      assigned_to: 'codex',
+      agent_config: null,
+      workspace_id: 1,
+      ticket_prefix: null,
+      project_ticket_no: null,
+      metadata: JSON.stringify({ pr_url: 'https://github.com/acme/app/pull/111', dispatch_session_id: 'mc-task-17' }),
+      github_repo: 'acme/app',
+      dispatch_attempts: 0,
+    })
+    mockRunOpenClaw.mockResolvedValue({
+      stdout: 'VERDICT: REJECTED\nNOTES: Quality check failed',
+      stderr: '',
+      code: 0,
+    })
+
+    const result = await runAegisReviews()
+
+    expect(result.ok).toBe(false)
+    expect(mockSubmitPullRequestReview).not.toHaveBeenCalled()
+    expect(mockCreateIssueComment).not.toHaveBeenCalled()
+    expect(mockSpawnAcpSession).not.toHaveBeenCalled()
+    expect(runCalls.some((call) => call.sql.includes('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?') && call.args[0] === 'review')).toBe(true)
+  })
 })

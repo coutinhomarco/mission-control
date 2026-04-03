@@ -566,6 +566,8 @@ function buildReviewPrompt(task: ReviewableTask): string {
   lines.push(
     '',
     '## Instructions',
+    'Review only the task and PR information provided in this prompt.',
+    'Do not rely on prior conversation memory, prior reviews, or assumptions that this request is spam or a duplicate.',
     'Evaluate whether the agent\'s response adequately addresses the task.',
     'Respond with EXACTLY one of these two formats:',
     '',
@@ -576,16 +578,44 @@ function buildReviewPrompt(task: ReviewableTask): string {
     'If the work needs improvement:',
     'VERDICT: REJECTED',
     'NOTES: <specific issues that need to be fixed>',
+    'For REJECTED responses, NOTES must be concrete and actionable.',
+    'Do not use generic text like "Quality check failed", "Needs work", or "Please fix".',
   )
 
   return lines.join('\n')
 }
 
+function isGenericRejectionNotes(notes: string): boolean {
+  const normalized = notes.trim().toLowerCase().replace(/\s+/g, ' ')
+  if (!normalized) return true
+  const genericPhrases = [
+    'quality check failed',
+    'needs work',
+    'please fix',
+    'fix this',
+    'not good enough',
+    'try again',
+    'rejected',
+    'failed review',
+  ]
+  if (genericPhrases.includes(normalized)) return true
+  if (normalized.split(' ').length < 3) return true
+  return false
+}
+
 function parseReviewVerdict(text: string): { status: 'approved' | 'rejected'; notes: string } {
   const upper = text.toUpperCase()
-  const status = upper.includes('VERDICT: APPROVED') ? 'approved' as const : 'rejected' as const
+  const hasApproved = upper.includes('VERDICT: APPROVED')
+  const hasRejected = upper.includes('VERDICT: REJECTED')
+  if (hasApproved === hasRejected) {
+    throw new Error('Aegis review returned invalid verdict format')
+  }
+  const status = hasApproved ? 'approved' as const : 'rejected' as const
   const notesMatch = text.match(/NOTES:\s*([\s\S]+?)\s*$/i)
   const extractedNotes = notesMatch?.[1]?.trim() || ''
+  if (status === 'rejected' && isGenericRejectionNotes(extractedNotes)) {
+    throw new Error('Aegis rejection notes were missing or non-actionable')
+  }
   const notes = extractedNotes.substring(0, 2000) || (status === 'approved' ? 'Quality check passed' : 'Quality check failed')
   return { status, notes }
 }
