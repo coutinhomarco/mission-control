@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildAegisReviewComment,
+  buildDispatchFailureComment,
+  buildDispatchFailureNotificationMessage,
+  buildDispatchFailureNotificationTitle,
   hasBlockingWorkspaceChanges,
   buildReworkPrompt,
   buildTaskPrompt,
@@ -133,5 +136,59 @@ describe('review follow-up prompts', () => {
 
     expect(prompt).toContain('Do not open a new PR')
     expect(prompt).toContain('/tmp/mc-task-9.pr')
+  })
+})
+
+describe('dispatch failure surfacing', () => {
+  it('formats a notification title with the task reference', () => {
+    expect(buildDispatchFailureNotificationTitle({
+      id: 12,
+      title: 'Fix sync loop',
+      ticket_prefix: 'OPS',
+      project_ticket_no: 7,
+    })).toBe('Dispatch failed for [OPS-007] Fix sync loop')
+  })
+
+  it('includes workspace, branch, and retry state in the notification message', () => {
+    const message = buildDispatchFailureNotificationMessage(
+      {
+        id: 12,
+        title: 'Fix sync loop',
+        ticket_prefix: null,
+        project_ticket_no: null,
+      },
+      'Command failed (git fetch origin dev): network down',
+      'dev',
+      '/root/things/profitstack-next',
+      2,
+      5,
+    )
+
+    expect(message).toContain('Dispatch retry 2/5 failed.')
+    expect(message).toContain('Base branch: dev.')
+    expect(message).toContain('Workspace: /root/things/profitstack-next.')
+    expect(message).toContain('network down')
+  })
+
+  it('formats a persistent task comment for terminal dispatch failures', () => {
+    const comment = buildDispatchFailureComment(
+      {
+        id: 12,
+        title: 'Fix sync loop',
+        ticket_prefix: null,
+        project_ticket_no: null,
+      },
+      'Command failed (git reset --hard origin/dev): permission denied',
+      'dev',
+      '/root/things/profitstack-next',
+      5,
+      5,
+    )
+
+    expect(comment).toContain('Dispatch error for [TASK-12] Fix sync loop')
+    expect(comment).toContain('Dispatch permanently failed after 5/5 attempts.')
+    expect(comment).toContain('Base branch: dev')
+    expect(comment).toContain('Workspace: /root/things/profitstack-next')
+    expect(comment).toContain('permission denied')
   })
 })

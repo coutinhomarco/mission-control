@@ -103,6 +103,12 @@ export function getTaskBaseBranch(task: Pick<DispatchableTask, 'github_default_b
   return branch
 }
 
+function getTaskReference(task: Pick<DispatchableTask, 'id' | 'ticket_prefix' | 'project_ticket_no'>): string {
+  return task.ticket_prefix && task.project_ticket_no
+    ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
+    : `TASK-${task.id}`
+}
+
 function parsePorcelainPath(line: string): string {
   const trimmed = line.trimEnd()
   if (trimmed.length <= 3) return ''
@@ -156,16 +162,15 @@ async function validatePrWorkflowPrereqs(workspace: string): Promise<string | nu
   return null
 }
 
-async function prepareWorkspaceForTask(workspace: string, baseBranch: string): Promise<void> {
-  const status = await runCommand('git', ['status', '--porcelain'], {
+export async function prepareWorkspaceForTask(workspace: string, baseBranch: string): Promise<void> {
+  await runCommand('git', ['reset', '--hard', 'HEAD'], {
     cwd: workspace,
     timeoutMs: 10_000,
   })
-  if (hasBlockingWorkspaceChanges(status.stdout)) {
-    throw new Error(
-      `Workspace ${workspace} has uncommitted changes; cannot reset to ${baseBranch} before creating the task branch`
-    )
-  }
+  await runCommand('git', ['clean', '-fd', '-e', '.openclaw'], {
+    cwd: workspace,
+    timeoutMs: 10_000,
+  })
 
   await runCommand('git', ['fetch', 'origin', baseBranch], {
     cwd: workspace,
@@ -188,12 +193,65 @@ async function prepareWorkspaceForTask(workspace: string, baseBranch: string): P
     cwd: workspace,
     timeoutMs: 30_000,
   })
+
+  await runCommand('git', ['reset', '--hard', `origin/${baseBranch}`], {
+    cwd: workspace,
+    timeoutMs: 15_000,
+  })
+  await runCommand('git', ['clean', '-fd', '-e', '.openclaw'], {
+    cwd: workspace,
+    timeoutMs: 10_000,
+  })
+}
+
+export function buildDispatchFailureNotificationTitle(task: Pick<DispatchableTask, 'id' | 'title' | 'ticket_prefix' | 'project_ticket_no'>): string {
+  return `Dispatch failed for [${getTaskReference(task)}] ${task.title}`
+}
+
+export function buildDispatchFailureNotificationMessage(
+  task: Pick<DispatchableTask, 'id' | 'title' | 'ticket_prefix' | 'project_ticket_no'>,
+  errorMsg: string,
+  baseBranch: string,
+  workspace: string,
+  attempts: number,
+  maxDispatchRetries: number,
+): string {
+  const attemptsNote = attempts >= maxDispatchRetries
+    ? `Dispatch permanently failed after ${attempts}/${maxDispatchRetries} attempts.`
+    : `Dispatch retry ${attempts}/${maxDispatchRetries} failed.`
+
+  return [
+    `${attemptsNote} Base branch: ${baseBranch}.`,
+    `Workspace: ${workspace}.`,
+    `Error: ${errorMsg.substring(0, 1000)}`,
+  ].join(' ')
+}
+
+export function buildDispatchFailureComment(
+  task: Pick<DispatchableTask, 'id' | 'title' | 'ticket_prefix' | 'project_ticket_no'>,
+  errorMsg: string,
+  baseBranch: string,
+  workspace: string,
+  attempts: number,
+  maxDispatchRetries: number,
+): string {
+  const attemptsNote = attempts >= maxDispatchRetries
+    ? `Dispatch permanently failed after ${attempts}/${maxDispatchRetries} attempts.`
+    : `Dispatch attempt ${attempts}/${maxDispatchRetries} failed.`
+
+  return [
+    `Dispatch error for [${getTaskReference(task)}] ${task.title}`,
+    '',
+    attemptsNote,
+    `Base branch: ${baseBranch}`,
+    `Workspace: ${workspace}`,
+    '',
+    errorMsg.substring(0, 5000),
+  ].join('\n')
 }
 
 export function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
-  const ticket = task.ticket_prefix && task.project_ticket_no
-    ? `${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`
-    : `TASK-${task.id}`
+  const ticket = getTaskReference(task)
   const baseBranch = getTaskBaseBranch(task)
 
   const lines = [
@@ -893,6 +951,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
   const now = Math.floor(Date.now() / 1000)
 
   for (const task of tasks) {
+    let workspace = '/root/things/profitstack-next'
+    const baseBranch = getTaskBaseBranch(task)
+
     // Mark as in_progress immediately to prevent re-dispatch
     db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
       .run('in_progress', now, task.id)
@@ -937,8 +998,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       const dispatchModel = classifyTaskModel(task)
       const resolvedAgentId = resolveGatewayAgentId(task)
       const prFile = `/tmp/mc-task-${task.id}.pr`
-      const workspace = taskMeta?.workspace || taskMeta?.cwd || '/root/things/profitstack-next'
-      const baseBranch = getTaskBaseBranch(task)
+      workspace = taskMeta?.workspace || taskMeta?.cwd || workspace
 
       let agentResponse: AgentResponseParsed
       let finalizeImmediately = true
@@ -1172,6 +1232,59 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
           reason: 'dispatch_failed',
         })
       }
+
+      const notificationTitle = buildDispatchFailureNotificationTitle(task)
+      const notificationMessage = buildDispatchFailureNotificationMessage(
+        task,
+        errorMsg,
+        baseBranch,
+        workspace,
+        newAttempts,
+        maxDispatchRetries,
+      )
+      const commentBody = buildDispatchFailureComment(
+        task,
+        errorMsg,
+        baseBranch,
+        workspace,
+        newAttempts,
+        maxDispatchRetries,
+      )
+
+      try {
+        db_helpers.createNotification(
+          task.assigned_to || task.agent_name,
+          'dispatch_error',
+          notificationTitle,
+          notificationMessage,
+          'task',
+          task.id,
+          task.workspace_id,
+        )
+      } catch (notifyErr) {
+        logger.warn({ taskId: task.id, err: notifyErr }, 'Failed to create dispatch error notification')
+      }
+
+      try {
+        db.prepare(`
+          INSERT INTO comments (task_id, author, content, created_at, workspace_id)
+          VALUES (?, 'scheduler', ?, ?, ?)
+        `).run(
+          task.id,
+          commentBody,
+          Math.floor(Date.now() / 1000),
+          task.workspace_id
+        )
+      } catch (commentErr) {
+        logger.warn({ taskId: task.id, err: commentErr }, 'Failed to store dispatch error comment')
+      }
+
+      eventBus.broadcast('task.updated', {
+        id: task.id,
+        status: newAttempts >= maxDispatchRetries ? 'failed' : 'assigned',
+        error_message: errorMsg.substring(0, 500),
+        dispatch_attempts: newAttempts,
+      })
 
       db_helpers.logActivity(
         'task_dispatch_failed',
