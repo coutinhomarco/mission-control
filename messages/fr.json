@@ -599,6 +599,7 @@
     "colReview": "Révision",
     "colQualityReview": "Révision qualité",
     "colDone": "Terminé",
+    "colFailed": "Échec",
     "recurring": "RÉCURRENT",
     "spawned": "GÉNÉRÉ",
     "spawnedFromTask": "Généré depuis la tâche #{id}",

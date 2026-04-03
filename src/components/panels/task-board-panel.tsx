@@ -22,7 +22,7 @@ interface Task {
   id: number
   title: string
   description?: string
-  status: 'backlog' | 'inbox' | 'assigned' | 'in_progress' | 'review' | 'quality_review' | 'done' | 'awaiting_owner'
+  status: 'backlog' | 'inbox' | 'assigned' | 'in_progress' | 'review' | 'quality_review' | 'done' | 'failed' | 'awaiting_owner'
   priority: 'low' | 'medium' | 'high' | 'critical' | 'urgent'
   assigned_to?: string
   created_by: string
@@ -96,6 +96,7 @@ const STATUS_COLUMN_KEYS = [
   { key: 'review', titleKey: 'colReview', color: 'bg-purple-500/20 text-purple-400' },
   { key: 'quality_review', titleKey: 'colQualityReview', color: 'bg-indigo-500/20 text-indigo-400' },
   { key: 'done', titleKey: 'colDone', color: 'bg-green-500/20 text-green-400' },
+  { key: 'failed', titleKey: 'colFailed', color: 'bg-red-500/20 text-red-400' },
 ]
 
 const AWAITING_OWNER_KEYWORDS = [
@@ -1429,6 +1430,7 @@ function TaskDetailModal({
     review: 'bg-purple-500/15 text-purple-400 border-purple-500/25',
     quality_review: 'bg-purple-500/15 text-purple-400 border-purple-500/25',
     done: 'bg-green-500/15 text-green-400 border-green-500/25',
+    failed: 'bg-red-500/15 text-red-400 border-red-500/25',
     awaiting_owner: 'bg-orange-500/15 text-orange-400 border-orange-500/25',
   }
 
@@ -1915,6 +1917,7 @@ function ClaudeCodeTasksSection() {
   const statusColor = (s: string) =>
     s === 'completed' ? 'text-green-400' :
     s === 'in_progress' ? 'text-blue-400' :
+    s === 'failed' ? 'text-red-400' :
     s === 'blocked' ? 'text-red-400' :
     s === 'awaiting_owner' ? 'text-orange-400' :
     'text-muted-foreground'
@@ -2413,6 +2416,7 @@ function EditTaskModal({
                   <option value="review">{t('colReview')}</option>
                   <option value="quality_review">{t('colQualityReview')}</option>
                   <option value="done">{t('colDone')}</option>
+                  <option value="failed">{t('colFailed')}</option>
                 </select>
               </div>
 

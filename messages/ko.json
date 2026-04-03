@@ -748,6 +748,7 @@
     "colReview": "검토",
     "colQualityReview": "품질 검토",
     "colDone": "완료",
+    "colFailed": "실패",
     "recurring": "반복",
     "spawned": "생성됨",
     "spawnedFromTask": "작업 #{id}에서 생성됨",

@@ -599,6 +599,7 @@
     "colReview": "На проверке",
     "colQualityReview": "Контроль качества",
     "colDone": "Готово",
+    "colFailed": "Сбой",
     "recurring": "ПОВТОРЯЮЩАЯСЯ",
     "spawned": "СОЗДАНА",
     "spawnedFromTask": "Создана из задачи #{id}",

@@ -88,7 +88,7 @@ function loadTaskResolutionFromAcpSession(sessionName: string): string | null {
 }
 
 // PR file polling for non-blocking ACP dispatch
-async function checkPrFiles() {
+export async function checkPrFiles() {
   const db = getDatabase()
   const TICK_MS = 60_000
 
@@ -123,6 +123,12 @@ async function checkPrFiles() {
           delete updatedMeta.target_session
           db.prepare('UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ?')
             .run('review', 'success', resolution, JSON.stringify(updatedMeta), Math.floor(Date.now() / 1000), row.id)
+          eventBus.broadcast('task.status_changed', {
+            id: row.id,
+            status: 'review',
+            previous_status: 'in_progress',
+            updated_at: Math.floor(Date.now() / 1000),
+          })
           updated.push(`task-${row.id} → review (${prUrl})`)
           try {
             const sessionId = String(meta?.dispatch_session_id || '').trim()

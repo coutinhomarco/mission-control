@@ -599,6 +599,7 @@
     "colReview": "レビュー",
     "colQualityReview": "品質レビュー",
     "colDone": "完了",
+    "colFailed": "失敗",
     "recurring": "定期",
     "spawned": "生成済み",
     "spawnedFromTask": "タスク #{id}から生成",

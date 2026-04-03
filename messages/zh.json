@@ -837,6 +837,7 @@
     "colReview": "审查",
     "colQualityReview": "质量审查",
     "colDone": "完成",
+    "colFailed": "失败",
     "recurring": "循环",
     "spawned": "已生成",
     "spawnedFromTask": "从任务 #{id} 生成",

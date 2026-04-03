@@ -599,6 +599,7 @@
     "colReview": "المراجعة",
     "colQualityReview": "مراجعة الجودة",
     "colDone": "مكتمل",
+    "colFailed": "فشل",
     "recurring": "متكرر",
     "spawned": "مُنشأ",
     "spawnedFromTask": "مُنشأ من المهمة #{id}",

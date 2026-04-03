@@ -3,6 +3,7 @@ import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { agentTaskLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { eventBus } from '@/lib/event-bus'
 
 type QueueReason = 'continue_current' | 'assigned' | 'at_capacity' | 'no_tasks_available'
 
@@ -121,6 +122,14 @@ export async function GET(request: NextRequest) {
     `).get(agent, now, workspaceId, agent) as any | undefined
 
     if (claimed) {
+      eventBus.broadcast('task.status_changed', {
+        id: claimed.id,
+        status: 'in_progress',
+        previous_status: claimed.status,
+        assigned_to: agent,
+        updated_at: now,
+      })
+
       return NextResponse.json({
         task: mapTaskRow(claimed),
         reason: 'assigned' as QueueReason,

@@ -17,6 +17,7 @@ describe('statusToLabel', () => {
     expect(statusToLabel('review').name).toBe('mc:review')
     expect(statusToLabel('quality_review').name).toBe('mc:quality-review')
     expect(statusToLabel('done').name).toBe('mc:done')
+    expect(statusToLabel('failed').name).toBe('mc:failed')
   })
 
   it('returns label with color and description', () => {
@@ -34,6 +35,7 @@ describe('labelToStatus', () => {
     expect(labelToStatus('mc:review')).toBe('review')
     expect(labelToStatus('mc:quality-review')).toBe('quality_review')
     expect(labelToStatus('mc:done')).toBe('done')
+    expect(labelToStatus('mc:failed')).toBe('failed')
   })
 
   it('returns null for unknown labels', () => {
@@ -43,7 +45,7 @@ describe('labelToStatus', () => {
   })
 
   it('is the inverse of statusToLabel', () => {
-    const statuses = ['backlog', 'inbox', 'assigned', 'in_progress', 'review', 'quality_review', 'done'] as const
+    const statuses = ['backlog', 'inbox', 'assigned', 'in_progress', 'review', 'quality_review', 'done', 'failed'] as const
     for (const status of statuses) {
       expect(labelToStatus(statusToLabel(status).name)).toBe(status)
     }
@@ -88,7 +90,7 @@ describe('labelToPriority', () => {
 
 describe('ALL_MC_LABELS', () => {
   it('contains all status and priority labels', () => {
-    expect(ALL_MC_LABELS.length).toBe(11) // 7 statuses + 4 priorities
+    expect(ALL_MC_LABELS.length).toBe(12) // 8 statuses + 4 priorities
     const names = ALL_MC_LABELS.map(l => l.name)
     expect(names).toContain('mc:inbox')
     expect(names).toContain('priority:critical')
@@ -103,10 +105,11 @@ describe('ALL_MC_LABELS', () => {
 })
 
 describe('ALL_STATUS_LABEL_NAMES', () => {
-  it('contains all 7 status label names', () => {
-    expect(ALL_STATUS_LABEL_NAMES).toHaveLength(7)
+  it('contains all 8 status label names', () => {
+    expect(ALL_STATUS_LABEL_NAMES).toHaveLength(8)
     expect(ALL_STATUS_LABEL_NAMES).toContain('mc:inbox')
     expect(ALL_STATUS_LABEL_NAMES).toContain('mc:done')
+    expect(ALL_STATUS_LABEL_NAMES).toContain('mc:failed')
   })
 })
 

@@ -748,6 +748,7 @@
     "colReview": "Review",
     "colQualityReview": "Quality Review",
     "colDone": "Done",
+    "colFailed": "Failed",
     "recurring": "RECURRING",
     "spawned": "SPAWNED",
     "spawnedFromTask": "Spawned from task #{id}",
